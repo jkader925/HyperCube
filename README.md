@@ -1,9 +1,10 @@
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" width="256" srcset="https://github.com/user-attachments/assets/970437ca-2664-48aa-add6-56c38d4a97c2">
-    <img width="100%" alt="Shows an illustrated sun in light color mode and a moon with stars in dark color mode." src="https://github.com/user-attachments/assets/c81d326e-fd83-40a4-a29c-1d135b9aabf6">
+    <source media="(prefers-color-scheme: dark)" width="100%" srcset="https://github.com/user-attachments/assets/223adf80-8792-454e-ad99-94bbef751a5c">
+    <img width="100%" alt="auto light/dark mode" src="https://github.com/user-attachments/assets/2e03646a-c6d5-444f-bcf6-bf43dfd4dd5c">
   </picture>
 </div>
+
 
 HyperCube is a specialized Python3-based spectral fitting tool designed for analyzing integral field spectroscopic (IFS), or hyperspectral data, with a focus on emission lines from interstellar gas. The tool combines a user-friendly [PyQT5](https://github.com/PyQt5) GUI with the robust and flexible fitting capabilities of [lmfit](https://github.com/lmfit/lmfit-py), and is particularly well-suited for interactive and batch process spectral modeling of 3D spectral data.
 
