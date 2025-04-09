@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>hypercube</string>
+	<key>CFBundleExecutable</key>
+	<string>hypercube</string>
+	<key>CFBundleIconFile</key>
+	<string>generated-3abcd2db89681aed7c8729b29ccfe77eb07f0b06d429678e1c0a48217df5c9bd.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.justinkader.hypercube</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>hypercube</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
