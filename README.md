@@ -25,8 +25,16 @@ This guide walks you through a basic analysis of a Keck Cosmic Wave Imager (KCWI
 From your new `hypercube` conda environment, open the tool via the following command:
 
 ```
-python
+python hypercube.py
 ```
+
+This should launch the main application window. You can now load the IFS data using the `Open FITS` button on the bottom right of the application window and selecting the file `IRAS_F23365+3604.fits`. The main application (visualizer) window will now show to panels: on the left is the image viewer, which initially shows a white light image of the galaxy (from integrating the spectrum in each spectral pixel, or "spaxel"), on the right is a live spectrum viewer that updates as you move the cursor across the white light image. 
+
+### Interacting with the Image Viewer Panel
+As the cursor is moved around the image, an orange rectangle indicates the currently focused spaxel. You can lock the spaxel by pressing the `L` key. To unlock, move the cursor back to the image viewer panel and press `L` again.
+
+### Interacting the the Spectrum Viewer Panel
+The spectrum viewer panel shows the spectrum contained in the currently-selected spaxel. You can zoom into a portion of the spectrum by clicking and dragging across the spectrum. As you do, a grey rectangular region will indicate the range that will be zoomed to when you release click. The new horizontal (spectral) range reflects the one you selected, while the new vertical (signal or flux) range is auto-scaled to show the continuum and the peaks of any lines in that spectral window. Right-click anywhere on the spectrum to bring up a `reset zoom` button which can be clicked to set the spectrum viewer window to its original range.
 
 ## Acknowledging HyperCube
 If you used HyperCube in your research, please consider acknowledging the use of the tool by including this text in your publications:
