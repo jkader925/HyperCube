@@ -15,22 +15,25 @@ from functools import partial
 import csv
 import gc
 import psutil
-
-from astropy.io import fits
-from astropy.wcs import WCS
+import os 
+from pathlib import Path
+import warnings
 
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.patches as patches
+
+from astropy.io import fits
+from astropy.wcs import WCS
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QVBoxLayout, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QWidget, QLabel, QFrame, QMenu, QTextEdit, QMainWindow,
-    QHBoxLayout, QMenuBar, QProgressBar, QDialog, 
+    QHBoxLayout, QMenuBar, QProgressBar, QDialog, QSplashScreen,
     QAction, QSplitter, QFileDialog, QApplication)
-from PyQt5.QtGui import QFontMetrics
+from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtGui import QKeySequence
 
 from lmfit import Model, Parameters
@@ -450,10 +453,10 @@ def generalized_model(x, slope, intercept, *gaussian_params):
 
     return model
 
-def load_stylesheet(app, filename):
-    with open(filename, 'r') as f:
-        style = f.read()
-        app.setStyleSheet(style)
+# def load_stylesheet(app, filename):
+#     with open(filename, 'r') as f:
+#         style = f.read()
+#         app.setStyleSheet(style)
 
 # Apply PyQt5-like styling to Matplotlib
 def apply_mpl_qss_style(fig, ax, line):
@@ -589,7 +592,7 @@ class ViewerWindow(QMainWindow):
         self.open_fits_button.clicked.connect(self.open_fits_file)
         bottom_layout.addWidget(self.open_fits_button, alignment=Qt.AlignRight)
 
-        self.open_fits_file()
+        # self.open_fits_file()
 
         main_layout.addLayout(bottom_layout)
 
@@ -602,7 +605,7 @@ class ViewerWindow(QMainWindow):
         self.setMenuBar(self.create_menu_bar_VisualizerWindow())
 
         # Ensure the window comes to the front
-        self.show()
+        # self.show()
         self.raise_()
         self.activateWindow()
 
@@ -3867,29 +3870,116 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if (button_type != 'line_name') & (button_type != 'SNR'):
             text_box.hide()
 
+def load_pixmap(image_path):
+    """Load QPixmap with proper error handling"""
+    pixmap = QPixmap()
+    if not pixmap.load(image_path):
+        # Try alternative loading method
+        with open(image_path, 'rb') as f:
+            pixmap.loadFromData(f.read())
+    if pixmap.isNull():
+        raise ValueError(f"Failed to load image: {image_path}\n"
+                       f"Supported formats: {', '.join(QPixmap.supportedImageFormats())}")
+    return pixmap
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = Path(sys._MEIPASS)
+    except Exception:
+        base_path = Path(__file__).parent
 
+    # Try multiple possible locations
+    search_paths = [
+        base_path / relative_path,
+        base_path / 'Resources' / relative_path,
+        Path.cwd() / relative_path
+    ]
     
+    for path in search_paths:
+        if path.exists():
+            print(f"Found resource at: {path}")
+            return str(path)
+    
+    raise FileNotFoundError(f"Resource not found in any of: {search_paths}")
+    
+    
+def load_stylesheet(app,filename):
+    try:
+        stylesheet_path = resource_path(filename)
+        print(f"Loading stylesheet from: {stylesheet_path}")
         
-
+        with open(stylesheet_path, "r") as f:
+            style = f.read()
+            app.setStyleSheet(style)
+    except Exception as e:
+        print(f"Error loading stylesheet: {e}")
+        # Fallback to basic dark theme
+        app.setStyleSheet("""
+            QWidget {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+        """)    
+    
 def main():
-    app = QApplication(sys.argv)
-
-
-    # Apply QSS stylesheet
-    load_stylesheet(app, 'QDarkOrange_style.qss')
-
-    # Create both windows and link them
-    viewer = ViewerWindow()
-    # fitparamwindow = FitParamsWindow(df_cont, df)
-
-    viewer.show()
-    # fitparamwindow.show()
-
-    sys.exit(app.exec_())
+    """Entry point for Hypercube spectral analysis tool."""
+    try:
+        app = QApplication(sys.argv)
+        load_stylesheet(app, 'QDarkOrange_style.qss')
+        
+        
+        print("Application starting...")
+        
+        # Load splash image
+        try:
+            image_path = resource_path("hypercube_logo.png")
+            print(f"Loading image from: {image_path}")
+            
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Image not found at: {image_path}")
+            
+            pixmap = load_pixmap(image_path)
+            pixmap = pixmap.scaled(400, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            print("Image loaded successfully")
+            
+        except Exception as e:
+            print(f"Image loading failed: {str(e)}")
+            # Fallback to blank pixmap
+            pixmap = QPixmap(400, 300)
+            pixmap.fill(Qt.white)
+        
+        
+        # Show splash screen
+        splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+        splash.show()
+        print("Splash screen shown")
+        
+        splash.raise_()
+        splash.repaint()
+        app.processEvents()
+        print("Events processed")
+        
+        # Create main window
+        print("Creating main window...")
+        viewer = ViewerWindow()
+        
+        # Set up transition
+        def show_main_window():
+            print("Closing splash and showing main window")
+            splash.finish(viewer)
+            viewer.show()
+        
+        QTimer.singleShot(2000, show_main_window)
+        print("Timer set")
+        
+        print("Entering main loop")
+        sys.exit(app.exec_())
+        
+    except Exception as e:
+        print(f"Fatal error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
-
-
-
