@@ -6,6 +6,32 @@ output formats, and every such change is called out under **Output format** belo
 
 ---
 
+## [Unreleased]
+
+### Fixed — display scaling
+
+- **The UI now follows the display's scale factor.** Qt's high-DPI support was never
+  switched on, so on an OS-scaled monitor (a 4K desktop at Windows 125%/150%) the whole
+  interface rendered at 100% — i.e. tiny. `AA_EnableHighDpiScaling` and
+  `AA_UseHighDpiPixmaps` are now set before the `QApplication` is created, together with
+  the `PassThrough` rounding policy, without which Qt rounds a fractional scale factor
+  *down* to the nearest integer and a 150% desktop still renders at 100%.
+- **Font sizes come from the platform's UI font instead of hardcoded pixels.** The theme
+  pinned `font-size: 9px` on every `QPushButton` — roughly half the platform UI font, and
+  HyperCube's interface is almost entirely buttons. Stylesheet font sizes are now rewritten
+  at load time into points scaled from the platform font; borders, padding and corner radii
+  are deliberately left unscaled so the theme keeps its hairlines.
+- **Every hardcoded widget dimension scales with the font** (`setFixedHeight`,
+  `setFixedSize`, `setMinimumWidth`, …), so larger text cannot clip its control. Values
+  computed from `sizeHint()` are left alone, as they already track the font.
+- **Embedded matplotlib panels scale too** — rcParams and the inline annotation sizes — so
+  axis labels no longer stay tiny while the surrounding UI grows.
+- **New View ▸ UI Scale menu** (Larger / Smaller / Reset, `Ctrl/Cmd +`, `Ctrl/Cmd -`,
+  `Ctrl/Cmd 0`) as a manual override on top of the automatic sizing, clamped to 70–300% and
+  remembered across sessions.
+
+---
+
 ## [v0.4.0] — 2026-08-24
 
 Measurement errors, propagated parameter uncertainties, and explicit output units. This
