@@ -11,13 +11,17 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 ---
 
-## What's New in v0.3.0
+## What's New in v0.4.0
 
-- **Kinematic groups (K1–K5).** Tie the velocity *and* velocity dispersion of multiple emission lines into a single kinematic solution with one click, directly from the Line Name window. Members share the same velocity and the same km/s dispersion (widths and centroids scaled by each line's rest wavelength); the group's reference line — the one carrying the free kinematics — is surfaced in the UI.
-- **Velocity dispersion in km/s.** σ is now displayed and edited in km/s throughout the GUI (parameter buttons, column headers, σ maps) and exported alongside the wavelength-space values in the CSV and FITS outputs.
-- **Constraint workflow upgrades.** A syntax **?** help button and an **Auto-suggest constraints** button in the Line Name window, plus clearer "constraints saved" feedback.
-- **Constraint correctness fixes (important).** Relational constraints referencing bracketed forbidden-line names (`[S II]`, `[N II]`, `[O III]`, …) were being silently dropped — now fixed. A separate bug that let amplitude constraints be lost during per-spaxel flux rescaling is also fixed, so constraints are now reliably respected in every spaxel.
-- **UI fix.** Checkbox check-marks now render correctly in the dark theme.
+- **Measurement errors are propagated into every uncertainty.** HyperCube now finds your cube's per-pixel flux errors automatically (a `ERR`/`VAR`/`IVAR`/`STAT` extension, or a sidecar file such as the KCWI DRP's `*_vcubes.fits`), converts them to 1σ, and **weights the fit by 1/σ**. The reported `*_std` values are therefore propagated measurement errors rather than residual-scatter estimates. See [Measurement errors & parameter uncertainties](#measurement-errors--parameter-uncertainties).
+- **A robust empirical fallback.** With no error cube — or an unusable one — the noise is measured per spaxel from the **line-free continuum inside each fit window** (DER_SNR). Whichever source is used is recorded per spaxel in the output as `noise_source`, so a fit table always states how its uncertainties were derived.
+- **New `Measurement Errors…` dialog** to override the automatic choice: pick any extension of any FITS file, declare whether it holds 1σ / variance / inverse variance, or force the empirical estimate.
+- **`vel_std`.** Velocity uncertainties are now written directly (σ_v = c·σ_λ/λ₀), along with `rchisq_w` — a reduced χ² over the fitted pixels that actually sits near 1 for a good fit.
+- **Units are explicit everywhere.** CSV column names carry their unit (`cen_fit_A`, `vel_std_kms`, `amp_fit_flux`, …), the cube's flux unit is written into the CSV header, FITS maps carry `BUNIT`, and **σ is a velocity dispersion in km/s** in every output. New `*_STD_` uncertainty maps are written to the FITS output. Older CSV/FITS products still load.
+- **Parallel cube fitting**, **Rectify Bad Fits**, **sequential core→outflow fitting**, **calibrated quality metrics**, **velocity and integrated-flux constraints**, **Smart Constraints**, and **multiple stellar regions** — all previously unreleased — ship in this version.
+- **Packaging fixes.** The stellar template libraries (`eMILES/`, `indo_us_library/`) and two required modules are now included in the repository, so a fresh clone runs — including stellar fitting — with no extra downloads.
+
+The full history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -35,6 +39,7 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 4. [Fitting Techniques](#fitting-techniques)
    - [Relational constraints & kinematic groups](#relational-constraints--kinematic-groups)
    - [Sequential core→outflow fitting](#sequential-coreoutflow-fitting)
+   - [Measurement errors & parameter uncertainties](#measurement-errors--parameter-uncertainties)
    - [Calibrated fit-quality metrics & the Quality Map](#calibrated-fit-quality-metrics--the-quality-map)
    - [Rectify Bad Fits](#rectify-bad-fits)
 5. [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf)
@@ -197,6 +202,18 @@ If you are not satisfied with the fit, you can specify parameter limits or param
 ### Outputting the Fit ###
 If you are satisfied with the cube fit, you can save the result to a csv table and/or a multi-extension FITS file. To do this, bring forward the Fit Parameters window and look at the Spectral Fitting panel. Here, you will find the `Save Cube Fit` and `Save Fit to FITS File` buttons, which output the fit to csv and FITS files, respectively. You can always view your fit result in HyperCube at a later time by opening the tool, loading the original FITS cube, opening the Fit Parameters window, and clicking the `Load Cube Fit` button.
 
+**Units are explicit in both outputs.** Every CSV column that has a physical unit carries it in its name:
+
+| suffix | meaning | examples |
+|---|---|---|
+| `_A` | Ångström | `cen_fit_A`, `cen_std_A`, `rest_wavelength_A` |
+| `_kms` | km/s | `vel_fit_kms`, `vel_std_kms`, `sigma_fit_kms`, `sigma_std_kms` |
+| `_flux` | the cube's flux unit | `amp_fit_flux`, `amp_std_flux`, `qa_noise_flux` |
+| `_fluxperA` | flux unit per Ångström | `cont_region1_slope_fit_fluxperA` |
+| `_deg`, `_pix` | degrees, spaxel index | `RA_deg`, `Dec_deg`, `spaxel_x_pix` |
+
+The flux unit itself is the cube's `BUNIT`, written into the CSV's scale/units header row next to the wavelength and velocity units. **Velocity dispersion is reported in km/s throughout** — in the GUI, in the CSV, and in the FITS maps (Ångström remains the internal storage unit, and is recoverable from the companion centroid column). In the FITS output every map carries a `BUNIT` header, `SIGMA_<line>` is in km/s, and each value map is paired with a `*_STD_<line>` 1σ uncertainty map. Uncertainty columns (`amp_std`, `cen_std`, `vel_std`, `sigma_std`) and their provenance (`noise_source`, `noise_median`, `noise_npix`) are described under [Measurement errors & parameter uncertainties](#measurement-errors--parameter-uncertainties). CSV and FITS products written by earlier versions still load.
+
 # Interactive Usage Mode
 One of the two main use cases for HyperCube is intuitive/dynamic spectral fitting (or data exploration), the other being automated/batch spectral fitting (described below in the [Pipeline Usage Mode](#pipeline-usage-mode) section). In interactive mode, spectral fitting more or less follows the steps outlined in the [Quick Start Guide](#quick-start-guide), i.e., we dynamically place continuum+line sets using the cursor and specify parameter values, names, limits, and constraints using the interactive GUI. *This usage mode is ideal for quick exploration of data cubes where visual feedback is critical.*
 
@@ -238,12 +255,16 @@ param  op  param_[line name]
 param  op  factor * param_[line name]
 ```
 
-where `param` is one of `amp`, `sigma`, `cen` (centroid), or `vel` (velocity), and `op` is one of `<=`, `<`, `>=`, `>`, `==`. For example:
+where `param` is one of `amp` (amplitude), `flux` (integrated line flux), `sigma`, `cen` (centroid), or `vel` (velocity), and `op` is one of `<=`, `<`, `>=`, `>`, `==`. For example:
 
 - `amp <= amp_[Halpha]` — keep a component fainter than another line
 - `sigma >= sigma_[Halpha]` — keep a component broader than another
-- `amp <= 0.33 * amp_[Halpha]` — fixed flux-ratio bound
+- `amp <= 0.33 * amp_[Halpha]` — fixed *amplitude*-ratio bound
+- `flux == 2.94 * flux_[[N II]_6548]` — fixed **integrated-flux** ratio (e.g. the [N II] 6584/6548 doublet)
+- `flux == 0.44..1.45 * flux_[[S II]_6731]` — flux ratio confined to a **range** (e.g. the density-sensitive [S II] 6716/6731 doublet); the fit picks the best ratio within the bounds
 - `vel == vel_[nii_1]` — tie velocities (shared kinematics)
+
+> **`amp` vs `flux`:** an `amp` constraint fixes the *peak height* ratio, which equals the flux ratio only when the two lines share the same width. A `flux` constraint fixes the *integrated* flux ratio directly (flux = amp·σ·√2π), automatically accounting for the fitted widths — so it gives the exact ratio even if the σ's differ or vary. Use `flux` for fixed atomic doublet ratios.
 
 A **?** help button lists the available parameters, operators, and the lines currently in the model. The **Auto-suggest constraints** button proposes sensible constraints based on the components' initial guesses, which you can review before applying. Constraints reference lines by **name**, so forbidden-line names containing brackets (e.g. `[S II]_6716`) are fully supported.
 
@@ -256,13 +277,13 @@ For multi-component fits it is often desirable for several lines to share one ki
 
 # Fitting Techniques
 
-HyperCube's per-spaxel fitting is powered by [`lmfit`](https://github.com/lmfit/lmfit-py): named parameters with bounds, algebraic constraints between parameters (`.expr`), per-parameter uncertainties from the covariance matrix, and χ²/BIC statistics. On top of that core, HyperCube layers several techniques aimed at getting **accurate, consistent fits across a whole cube** without hand-tuning every spaxel. This section summarizes them; the constraint syntax itself is covered under [Relational Constraints](#relational-constraints).
+HyperCube's per-spaxel fitting is powered by [`lmfit`](https://github.com/lmfit/lmfit-py): named parameters with bounds, algebraic constraints between parameters (`.expr`), per-parameter uncertainties from the covariance matrix, and χ²/BIC statistics. On top of that core, HyperCube layers several techniques aimed at getting **accurate, consistent fits across a whole cube** without hand-tuning every spaxel, and it feeds lmfit a real per-pixel noise model so those covariance uncertainties mean something (see [Measurement errors & parameter uncertainties](#measurement-errors--parameter-uncertainties)). This section summarizes them; the constraint syntax itself is covered under [Relational Constraints](#relational-constraints).
 
 ### Relational constraints & kinematic groups
 
 Tie parameters across lines to encode physics and reduce free parameters:
 
-- **Amplitude / width / centroid relations** — e.g. `amp <= amp_[Halpha]`, `sigma >= sigma_[Halpha_b]`, fixed flux-ratio bounds `amp <= 0.33 * amp_[Halpha]`.
+- **Amplitude / flux / width / centroid relations** — e.g. `amp <= amp_[Halpha]`, `sigma >= sigma_[Halpha_b]`, amplitude bounds `amp <= 0.33 * amp_[Halpha]`, and fixed **integrated-flux** ratios `flux == 2.94 * flux_[[N II]_6548]` (exact even when widths differ, since flux = amp·σ·√2π).
 - **Velocity ties, windows, and one-sided bounds** — `vel == vel_[B]` (exact tie), `vel == vel_[B] +- 300` (within ±300 km/s), `vel <= vel_[B] + 300` / `vel >= vel_[B] - 300` (one-sided). These are realized internally as a bounded additive centroid offset (`cen_A = (restA/restB)·cen_B + offset`), so they are physically correct for lines at different rest wavelengths.
 - **Kinematic groups (K1–K5)** — a one-click shortcut that ties a set of lines to share one velocity *and* one km/s velocity dispersion (see [Kinematic Groups](#kinematic-groups-k-groups)).
 
@@ -272,16 +293,39 @@ Lines with a narrow core **and** a broad/outflow component (an AGN/starburst out
 
 The **Sequential** toggle (in the Spectral Fitting toolbar) breaks this degeneracy structurally. For every line that has a broad (`_b`) partner it fits in stages: **(1)** fit the narrow core(s) with the broad amplitudes suppressed; **(2)** freeze the core and continuum and fit each broad component to the *residual*, where it is the only feature and cannot collapse onto the core; **(3)** a joint polish from that solution. It needs no per-galaxy tuning and leans on the (typically tight) bounds you already set on the narrow component. It has no effect on lines without a broad partner, and toggling it off reproduces the standard joint fit exactly. Rectify's refits inherit the staged fit automatically.
 
+### Measurement errors & parameter uncertainties
+
+Every uncertainty HyperCube reports — `amp_std`, `cen_std`, `vel_std`, `sigma_std` — comes from the **covariance matrix of a fit weighted by the per-pixel flux measurement errors**. This section states exactly where those flux errors come from and what the resulting uncertainties do and do not include.
+
+**Where the flux errors come from.** At cube ingest HyperCube looks for a per-pixel 1σ flux uncertainty, in this order, and prints what it found:
+
+1. **An error extension of the science file** — `ERR`, `VAR`, `VARIANCE`, `IVAR`, `STAT`, `FLUXERR`, … (JWST `s3d` products, MUSE, and similar). Variance and inverse-variance are converted to 1σ; entries that cannot be a real error (negative variance, non-positive inverse variance) are discarded rather than trusted, and those pixels drop out of the fit.
+2. **A sidecar file next to the cube** — the KCWI DRP convention `*_icubes.fits` → `*_vcubes.fits`, plus generic `*_err`, `*_var`, `*_sigma`, `*_ivar` companions. The shape must match the cube.
+3. **An empirical estimate** — used when neither exists, or when what exists turns out to be unusable (for example a PSF-subtracted product whose `ERR` extension was never populated). The noise is measured **per spaxel, from the line-free pixels inside each fit window**, using the DER_SNR estimator (Stoehr et al. 2008): a MAD-style statistic built on second differences, σ ≈ 1.4826/√6 · median(|2f<sub>i</sub> − f<sub>i−2</sub> − f<sub>i+2</sub>|). The second difference removes any smooth continuum, so a sloped or curved baseline cannot inflate it, and the median makes it robust to the minority of pixels carrying emission lines (which are additionally masked out to ±3σ of their initial guesses).
+
+Detection is automatic and silent. To override it, press **`Measurement Errors…`** in the *Cube:* row of the Fit Parameters window: choose any extension of any FITS file, declare whether its values are 1σ / variance / inverse variance, or force the empirical estimate. The choice is stored in `.hcsession` files, and **which source was actually used is written into every row of the fit output** as `noise_source`, together with `noise_median` (the median σ over the pixels used) and `noise_npix`.
+
+**How the errors enter the fit.** The fit is weighted by 1/σ inside the fit windows and **zero-weighted outside them**. This matters: HyperCube's model is identically zero outside a continuum region, so out-of-window pixels contain no information about any parameter — but they used to enter χ² anyway, and lmfit's default `scale_covar` rescaling then inflated every reported uncertainty by that irrelevant residual. With a real noise model in hand the covariance is left unscaled (`scale_covar=False`), so the reported `*_std` are honest 1σ measurement uncertainties.
+
+**What this does and doesn't include.** These are the standard Levenberg–Marquardt covariance errors: symmetric, Gaussian, and propagated through any relational constraints or kinematic groups you have set (tied parameters get their uncertainties propagated through the constraint expressions). They capture photon/detector noise as described by your error cube or the empirical estimate. They do **not** capture model inadequacy — an unmodelled broad wing or a misplaced continuum shifts the best-fit values without necessarily widening the covariance. Two practical caveats:
+
+- **Bounded parameters.** A parameter sitting against its `min`/`max` gets a slightly optimistic error (~7% low in testing) from lmfit's bounded-parameter transform, and a symmetric ±σ is the wrong shape for a truncated distribution anyway. Treat uncertainties on railed parameters with suspicion — the [Quality Map](#calibrated-fit-quality-metrics--the-quality-map) is the better guide there.
+- **Integrated flux.** Line flux is √2π·amp·σ<sub>λ</sub>, and amp and σ are strongly anti-correlated. Only the diagonal of the covariance is written to the output, so combining `amp_std` and `sigma_std` as if independent will misestimate the flux error.
+
+Validated by Monte Carlo against the true scatter of repeated refits: the reported `vel_std` reproduces that scatter to 0.3% for unbounded parameters.
+
+**Reading the χ².** With weights in place, `rchisq_w` — the reduced χ² over the weighted pixels — is the meaningful goodness-of-fit number and sits near 1 for a good fit with a correct noise model. It is available as a Quality Map and as a Rectify/Mask criterion. lmfit's native `rchisq` divides by the *full* spectrum length rather than the fitted pixels, so it reads low by roughly the fraction of the spectrum your fit windows cover and should not be compared to 1.
+
 ### Calibrated fit-quality metrics & the Quality Map
 
-The native reduced χ² lmfit reports is **unweighted and flux-rescaled** (no per-spaxel noise model), so it is not comparable between bright and faint spaxels and can rank a badly-fit bright spaxel *better* than a well-fit faint one. HyperCube therefore computes, per spaxel, a set of calibrated, scale-free quality statistics over the line cores vs. the off-line continuum:
+Reduced χ² alone — even the weighted `rchisq_w` — averages the line cores together with the far more numerous continuum pixels, so a badly-fit line profile can hide inside a good-looking global number. HyperCube therefore computes, per spaxel, a set of calibrated, scale-free quality statistics that compare the line cores against the off-line continuum directly:
 
 - **Core/continuum ratio** — mean(residual²) in the line cores ÷ in the continuum; ≈1 = good, ≫1 = poorly-fit profile. Noise-independent and the headline metric.
 - **Signed-residual z** — direction and significance of leftover flux: large positive = missed flux (an unmodeled component), negative = over-subtracted.
 - **Runs z** — a runs test on the residual signs flags systematic *shape* errors even when amplitudes look right.
 - **Calibrated continuum χ²** — reduced χ² over off-line pixels (≈1 for a good fit); the calibration anchor.
 
-The **Quality Map ▾** button renders any of these (plus the native rChi²) as a cube map, so you can *see* which spaxels actually failed. These columns are written to the CSV/FITS output.
+The **Quality Map ▾** button renders any of these — plus the weighted `rchisq_w` and the native rChi² — as a cube map, so you can *see* which spaxels actually failed. These columns are written to the CSV/FITS output.
 
 ### Rectify Bad Fits
 

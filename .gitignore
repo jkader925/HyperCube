@@ -14,9 +14,11 @@ dist/
 *.hcsession
 *.csv
 
-# Bundled stellar template libraries (ship separately, not via git)
-eMILES/
-indo_us_library/
+# Bundled stellar template libraries — these SHIP WITH the tool (8.5 MB total).
+# They live under the *.fits rule above, so they need explicit negations; without
+# these a fresh clone has no stellar templates and pPXF fitting is unavailable.
+!eMILES/**
+!indo_us_library/**
 
 # Keep small example/config CSVs explicitly if needed by un-ignoring, e.g.:
 # !example_config.csv
