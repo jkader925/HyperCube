@@ -35,14 +35,14 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QSize
+from PyQt5.QtCore import Qt, QTimer, QSize, QSettings
 from PyQt5.QtWidgets import (
     QVBoxLayout, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QWidget, QLabel, QFrame, QMenu, QTextEdit, QMainWindow,
     QHBoxLayout, QMenuBar, QProgressBar, QDialog, QSplashScreen,
     QAction, QSplitter, QFileDialog, QApplication, QGroupBox, QMessageBox,
     QDockWidget, QComboBox, QScrollBar, QCheckBox, QRadioButton, QButtonGroup)
-from PyQt5.QtGui import QFontMetrics, QPixmap
+from PyQt5.QtGui import QFontMetrics, QPixmap, QGuiApplication
 from PyQt5.QtGui import QKeySequence
 
 from lmfit import Model, Parameters
@@ -201,6 +201,199 @@ def _ref_line_name(token):
 
 # Speed of light (km/s), used to present Gaussian sigma as a velocity dispersion.
 C_KMS = 299792.458
+
+
+# ── Display / UI scaling ─────────────────────────────────────────────────────
+# The layout and the .qss theme were written against a 9 pt UI font on a 96 dpi
+# display, with hardcoded pixel sizes (9 px button text, 24-32 px control
+# heights). On a high-density or OS-scaled monitor that renders far too small.
+# Sizes are therefore derived at run time from the platform's own UI font plus
+# an optional user preference, and Qt's high-DPI scaling is switched on in
+# main() so the whole UI follows the display's scale factor.
+UI_DESIGN_PT = 9.0                 # UI font size the layout was designed against
+UI_SCALE_MIN, UI_SCALE_MAX = 0.7, 3.0
+UI_SCALE_STEP = 1.1                # View > UI Scale > Larger / Smaller
+
+# Font roles, as multiples of the platform UI font size.
+_UI_FONT_ROLES = {'small': 0.92, 'normal': 1.0, 'header': 1.45}
+
+_UI_PLATFORM_PT = UI_DESIGN_PT     # the platform's own UI font size
+_UI_SCALE_NOTICE_SHOWN = False     # the "restart to apply everywhere" note
+_UI_USER_SCALE = 1.0               # the user's preference (persisted)
+_UI_SCALE = 1.0                    # effective multiplier for pixel dimensions
+
+
+def ui_scale():
+    """Effective multiplier applied to hardcoded pixel dimensions."""
+    return _UI_SCALE
+
+
+def ui_px(n):
+    """Scale a hardcoded pixel dimension to the current UI scale."""
+    try:
+        return max(1, int(round(float(n) * _UI_SCALE)))
+    except (TypeError, ValueError):
+        return n
+
+
+def ui_font_factor():
+    """Multiplier taking a design-time font size to the current UI scale."""
+    return (_UI_PLATFORM_PT / UI_DESIGN_PT) * _UI_USER_SCALE
+
+
+def ui_font_pt(role='normal'):
+    """Point size for a font role, following the platform font + user scale."""
+    return round(_UI_PLATFORM_PT * _UI_FONT_ROLES.get(role, 1.0) * _UI_USER_SCALE, 1)
+
+
+def ui_font_css(role='normal'):
+    """A `font-size` declaration for inline stylesheets, in **points** so it
+    tracks the platform font and the display scale rather than raw pixels."""
+    return f'font-size: {ui_font_pt(role)}pt;'
+
+
+def ui_fs(points):
+    """Scale a matplotlib font size (already in points) by the UI scale."""
+    try:
+        return max(4.0, round(float(points) * ui_font_factor(), 1))
+    except (TypeError, ValueError):
+        return points
+
+
+def enable_high_dpi():
+    """Opt in to Qt's high-DPI scaling. MUST run before a QApplication exists."""
+    for attr in ('AA_EnableHighDpiScaling', 'AA_UseHighDpiPixmaps'):
+        if hasattr(Qt, attr):
+            QApplication.setAttribute(getattr(Qt, attr), True)
+    # Without PassThrough, Qt rounds a fractional display scale (Windows 125% /
+    # 150%) down to the nearest integer — which is exactly what renders a scaled
+    # desktop at 100%, i.e. tiny.
+    try:
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:
+        pass
+
+
+def _apply_matplotlib_scale():
+    """Keep the embedded matplotlib panels in step with the UI scale."""
+    base = _UI_PLATFORM_PT * _UI_USER_SCALE
+    try:
+        plt.rcParams.update({
+            'font.size': round(base * 0.85, 1),
+            'axes.titlesize': round(base * 0.95, 1),
+            'axes.labelsize': round(base * 0.90, 1),
+            'xtick.labelsize': round(base * 0.80, 1),
+            'ytick.labelsize': round(base * 0.80, 1),
+            'legend.fontsize': round(base * 0.80, 1),
+        })
+    except Exception as e:
+        print(f'UI scale: could not update matplotlib defaults: {e}')
+
+
+def init_ui_scale(app):
+    """Derive the UI scale from the platform font and the saved preference."""
+    global _UI_PLATFORM_PT, _UI_USER_SCALE, _UI_SCALE
+    pt = app.font().pointSizeF()
+    _UI_PLATFORM_PT = pt if pt and pt > 0 else UI_DESIGN_PT
+    try:
+        _UI_USER_SCALE = float(QSettings('HyperCube', 'HyperCube').value('ui/scale', 1.0))
+    except (TypeError, ValueError):
+        _UI_USER_SCALE = 1.0
+    _UI_USER_SCALE = min(max(_UI_USER_SCALE, UI_SCALE_MIN), UI_SCALE_MAX)
+    # Pixel dimensions only ever grow: a platform whose UI font is larger than
+    # the design's needs proportionally taller controls, but a smaller one must
+    # not shrink them below what the layout already assumed.
+    grow = min(max(_UI_PLATFORM_PT / UI_DESIGN_PT, 1.0), 1.5)
+    _UI_SCALE = grow * _UI_USER_SCALE
+    _apply_matplotlib_scale()
+    return _UI_SCALE
+
+
+def set_ui_user_scale(value):
+    """Persist and apply a new user UI scale. Returns the value applied."""
+    global _UI_USER_SCALE
+    app = QApplication.instance()
+    value = min(max(float(value), UI_SCALE_MIN), UI_SCALE_MAX)
+    QSettings('HyperCube', 'HyperCube').setValue('ui/scale', value)
+    _UI_USER_SCALE = value
+    if app is not None:
+        init_ui_scale(app)
+        load_stylesheet(app, 'QDarkOrange_style.qss')
+    return _UI_USER_SCALE
+
+
+def ui_user_scale():
+    """The user's current UI scale preference."""
+    return _UI_USER_SCALE
+
+
+def scale_stylesheet(style):
+    """Rewrite the .qss's hardcoded pixel sizes for the current UI scale.
+
+    Font sizes become **points** so they follow the platform font and the
+    display's scale factor; layout constraints (min/max width & height) are
+    scaled in place. Borders, padding and corner radii are left alone so the
+    theme keeps its crisp hairlines.
+    """
+    def _font(m):
+        # The theme's font sizes are relative to its 9 px button text.
+        return f"font-size: {round(float(m.group(1)) / 9.0 * ui_font_pt('small'), 1)}pt"
+
+    def _dim(m):
+        return f'{m.group(1)}: {ui_px(m.group(2))}px'
+
+    style = re.sub(r'font-size:\s*([0-9.]+)px', _font, style)
+    # (?<![-\w]) keeps this off `border-width`, `border-top-width`, etc.
+    style = re.sub(r'(?<![-\w])(min-width|max-width|min-height|max-height|width|height)'
+                   r'\s*:\s*([0-9.]+)px', _dim, style)
+    return style
+
+
+def add_ui_scale_menu(window, view_menu):
+    """Add a "UI Scale" submenu (Larger / Smaller / Reset) to a View menu.
+
+    HyperCube already follows the display's scale factor and the platform's UI
+    font automatically; this is the manual override on top of that, for dense
+    desktop monitors where the automatic size still reads too small. The choice
+    is remembered across sessions.
+    """
+    scale_menu = view_menu.addMenu('UI Scale')
+
+    def _label():
+        scale_menu.setTitle(f'UI Scale ({round(ui_user_scale() * 100)}%)')
+
+    def _apply(factor=None, reset=False):
+        global _UI_SCALE_NOTICE_SHOWN
+        before = ui_user_scale()
+        applied = set_ui_user_scale(1.0 if reset else before * factor)
+        _label()
+        if abs(applied - before) < 1e-6:
+            return                      # already at the limit; say nothing
+        print(f'UI scale: {round(applied * 100)}%')
+        # Say this once per session, not on every keypress.
+        if not _UI_SCALE_NOTICE_SHOWN:
+            _UI_SCALE_NOTICE_SHOWN = True
+            QMessageBox.information(
+                window, 'UI Scale',
+                f'UI scale set to {round(applied * 100)}%.\n\n'
+                'Text and the theme update immediately. Panels that were already '
+                'built keep their current row heights until they are rebuilt, so '
+                'restart HyperCube to apply the new scale everywhere.\n\n'
+                'Ctrl/Cmd + and Ctrl/Cmd - adjust it; Ctrl/Cmd 0 resets.')
+
+    # 'Ctrl+=' as well as 'Ctrl++': on most layouts '+' needs Shift, and users
+    # reach for the unshifted key.
+    mk = [('Larger', ['Ctrl++', 'Ctrl+='], lambda: _apply(UI_SCALE_STEP)),
+          ('Smaller', ['Ctrl+-'], lambda: _apply(1.0 / UI_SCALE_STEP)),
+          ('Reset', ['Ctrl+0'], lambda: _apply(reset=True))]
+    for text, seqs, slot in mk:
+        act = QAction(text, window)
+        act.setShortcuts([QKeySequence(q) for q in seqs])
+        act.triggered.connect(slot)
+        scale_menu.addAction(act)
+    _label()
+    return scale_menu
 
 
 def sigma_wl_to_kms(sigma_wl, centroid_wl):
@@ -1290,7 +1483,8 @@ class ViewerWindow(QMainWindow):
             s = QFrame(self); s.setFrameShape(QFrame.VLine); s.setFrameShadow(QFrame.Sunken)
             return s
         def _tbtn(label, tip, size=28):
-            b = QPushButton(label, self); b.setFixedSize(size, size); b.setToolTip(tip)
+            b = QPushButton(label, self)
+            b.setFixedSize(ui_px(size), ui_px(size)); b.setToolTip(tip)
             return b
 
         # ── Primary toolbar (Open FITS · Fit Parameters · λScale · FScale) ──
@@ -1299,7 +1493,7 @@ class ViewerWindow(QMainWindow):
         primary_bar.setSpacing(8)
 
         self.open_fits_button = QPushButton("  ⬆  Open FITS", self)
-        self.open_fits_button.setFixedHeight(32)
+        self.open_fits_button.setFixedHeight(ui_px(32))
         self.open_fits_button.setStyleSheet(
             "QPushButton { background-color: #d7801a; color: white; font-weight: bold;"
             "  border-radius: 5px; padding: 0 14px; }"
@@ -1311,7 +1505,7 @@ class ViewerWindow(QMainWindow):
         primary_bar.addWidget(_vsep())
 
         self.open_fit_params_button = QPushButton("▼  Fit Parameters", self)
-        self.open_fit_params_button.setFixedHeight(32)
+        self.open_fit_params_button.setFixedHeight(ui_px(32))
         self.open_fit_params_button.setToolTip("Toggle Fit Parameters panel")
         self.open_fit_params_button.clicked.connect(self.toggle_fit_params_dock)
         primary_bar.addWidget(self.open_fit_params_button)
@@ -1319,14 +1513,14 @@ class ViewerWindow(QMainWindow):
         primary_bar.addWidget(_vsep())
 
         self.WLscalefactor_button = QPushButton("λ Scale", self)
-        self.WLscalefactor_button.setFixedHeight(32)
+        self.WLscalefactor_button.setFixedHeight(ui_px(32))
         self.WLscalefactor_button.setToolTip("Wavelength scale factor")
         self.WLscalefactor_button.setEnabled(False)
         self.WLscalefactor_button.clicked.connect(self.press_scaleWL_button)
         primary_bar.addWidget(self.WLscalefactor_button)
 
         self.fluxscalefactor_button = QPushButton("F Scale", self)
-        self.fluxscalefactor_button.setFixedHeight(32)
+        self.fluxscalefactor_button.setFixedHeight(ui_px(32))
         self.fluxscalefactor_button.setToolTip("Flux scale factor")
         self.fluxscalefactor_button.setEnabled(False)
         self.fluxscalefactor_button.clicked.connect(self.press_scaleflux_button)
@@ -1336,7 +1530,7 @@ class ViewerWindow(QMainWindow):
 
         primary_bar_widget = QWidget()
         primary_bar_widget.setLayout(primary_bar)
-        primary_bar_widget.setFixedHeight(42)
+        primary_bar_widget.setFixedHeight(ui_px(42))
 
         # ── Main layout ─────────────────────────────────────────────────
         main_layout = QVBoxLayout()
@@ -1367,9 +1561,9 @@ class ViewerWindow(QMainWindow):
         img_bar.addWidget(self.zoom_out_btn)
 
         self.zoom_combo = QComboBox(self)
-        self.zoom_combo.setFixedHeight(24)
-        self.zoom_combo.setMinimumWidth(100)
-        self.zoom_combo.setMaximumWidth(130)
+        self.zoom_combo.setFixedHeight(ui_px(24))
+        self.zoom_combo.setMinimumWidth(ui_px(100))
+        self.zoom_combo.setMaximumWidth(ui_px(130))
         self.zoom_combo.addItems([
             "Fit window", "Fit width", "Fit height",
             "3.125%", "6.25%", "12.5%", "25%", "50%",
@@ -1388,7 +1582,7 @@ class ViewerWindow(QMainWindow):
 
         # Stretch + Scale
         self.stretch_combo = QComboBox(self)
-        self.stretch_combo.setFixedHeight(24)
+        self.stretch_combo.setFixedHeight(ui_px(24))
         self.stretch_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.stretch_combo.addItems(["minmax", "99.9%", "99.5%", "99%", "98%", "95%", "zscale", "manual"])
         self.stretch_combo.setCurrentText("99%")
@@ -1398,7 +1592,7 @@ class ViewerWindow(QMainWindow):
         img_bar.addWidget(self.stretch_combo)
 
         self.scale_combo = QComboBox(self)
-        self.scale_combo.setFixedHeight(24)
+        self.scale_combo.setFixedHeight(ui_px(24))
         self.scale_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.scale_combo.addItems(["Linear", "Log", "Square root", "Squared", "Asinh"])
         self.scale_combo.setCurrentText("Linear")
@@ -1411,7 +1605,7 @@ class ViewerWindow(QMainWindow):
 
         # Colormap + Reset
         self.cube_cmap_combo = QComboBox(self)
-        self.cube_cmap_combo.setFixedHeight(24)
+        self.cube_cmap_combo.setFixedHeight(ui_px(24))
         self.cube_cmap_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.cube_cmap_combo.addItems(['gray','gray_r','viridis','plasma','inferno','magma','hot','cool','Blues','Reds','Greens','bwr','seismic'])
         self.cube_cmap_combo.setCurrentText('gray')
@@ -1423,7 +1617,7 @@ class ViewerWindow(QMainWindow):
         img_bar.addWidget(self.cube_cmap_combo)
 
         self.reset_view_btn = QPushButton("Reset", self)
-        self.reset_view_btn.setFixedHeight(24)
+        self.reset_view_btn.setFixedHeight(ui_px(24))
         self.reset_view_btn.setToolTip("Reset to original view: gray colormap, default zoom and scaling")
         self.reset_view_btn.clicked.connect(self._cube_reset_view)
         img_bar.addWidget(self.reset_view_btn)
@@ -1451,7 +1645,7 @@ class ViewerWindow(QMainWindow):
             self._xform_buttons.append(b)
 
         self.coords_toggle_btn = QPushButton("X/Y", self)
-        self.coords_toggle_btn.setFixedSize(40, 24)
+        self.coords_toggle_btn.setFixedSize(ui_px(40), ui_px(24))
         self.coords_toggle_btn.setToolTip("Toggle between X/Y pixel and RA/Dec axis labels")
         self.coords_toggle_btn.clicked.connect(self._cube_toggle_coords)
         img_bar.addWidget(self.coords_toggle_btn)
@@ -1460,7 +1654,7 @@ class ViewerWindow(QMainWindow):
 
         # Background image + opacity slider
         self.bkg_image_btn = QPushButton("🌌 Bkg", self)
-        self.bkg_image_btn.setFixedHeight(24)
+        self.bkg_image_btn.setFixedHeight(ui_px(24))
         self.bkg_image_btn.setToolTip("Overlay background image (HST/Chandra) — requires resolved source")
         self.bkg_image_btn.setEnabled(False)
         self.bkg_image_btn.clicked.connect(self._show_bkg_image_dialog)
@@ -1469,8 +1663,8 @@ class ViewerWindow(QMainWindow):
         self.cube_opacity_slider = QtWidgets.QSlider(Qt.Horizontal, self)
         self.cube_opacity_slider.setRange(0, 100)
         self.cube_opacity_slider.setValue(100)
-        self.cube_opacity_slider.setFixedWidth(70)
-        self.cube_opacity_slider.setFixedHeight(20)
+        self.cube_opacity_slider.setFixedWidth(ui_px(70))
+        self.cube_opacity_slider.setFixedHeight(ui_px(20))
         self.cube_opacity_slider.setToolTip("Cube overlay opacity")
         self.cube_opacity_slider.setVisible(False)
         self.cube_opacity_slider.valueChanged.connect(self._cube_opacity_changed)
@@ -1482,9 +1676,9 @@ class ViewerWindow(QMainWindow):
         # resizing the panel never hides it.
         img_bar_widget = QWidget()
         img_bar_widget.setLayout(img_bar)
-        img_bar_widget.setFixedHeight(30)
+        img_bar_widget.setFixedHeight(ui_px(30))
         # The cube panel now holds only the canvas, so it can shrink freely.
-        self.left_panel.setMinimumWidth(120)
+        self.left_panel.setMinimumWidth(ui_px(120))
 
         # Canvas + scrollbars
         self.canvas = FigureCanvas(plt.Figure())
@@ -1533,24 +1727,24 @@ class ViewerWindow(QMainWindow):
         spec_bar.setSpacing(4)
 
         _cml = QLabel("Channel map:")
-        _cml.setStyleSheet("color: #aaa; font-size: 11px;")
+        _cml.setStyleSheet(f"color: #aaa; {ui_font_css('small')}")
         spec_bar.addWidget(_cml)
 
         self.chanmap_prev_btn = QPushButton("−", self)
-        self.chanmap_prev_btn.setFixedSize(24, 24)
+        self.chanmap_prev_btn.setFixedSize(ui_px(24), ui_px(24))
         self.chanmap_prev_btn.setToolTip("Shift channel map selection left by 1 pixel")
         self.chanmap_prev_btn.clicked.connect(lambda: self._chanmap_shift(-1))
         spec_bar.addWidget(self.chanmap_prev_btn)
 
         self.chanmap_centre_btn = SpaxelButton("Pixel: —", "Channel centre")
-        self.chanmap_centre_btn.setFixedHeight(24)
-        self.chanmap_centre_btn.setMinimumWidth(90)
+        self.chanmap_centre_btn.setFixedHeight(ui_px(24))
+        self.chanmap_centre_btn.setMinimumWidth(ui_px(90))
         self.chanmap_centre_btn.setToolTip("Centre pixel of channel map selection — click to edit")
         self.chanmap_centre_btn.clicked.connect(self._chanmap_centre_clicked)
         spec_bar.addWidget(self.chanmap_centre_btn)
 
         self.chanmap_next_btn = QPushButton("+", self)
-        self.chanmap_next_btn.setFixedSize(24, 24)
+        self.chanmap_next_btn.setFixedSize(ui_px(24), ui_px(24))
         self.chanmap_next_btn.setToolTip("Shift channel map selection right by 1 pixel")
         self.chanmap_next_btn.clicked.connect(lambda: self._chanmap_shift(+1))
         spec_bar.addWidget(self.chanmap_next_btn)
@@ -1560,7 +1754,7 @@ class ViewerWindow(QMainWindow):
         # visible when the panels are resized.
         self.spec_bar_widget = QWidget()
         self.spec_bar_widget.setLayout(spec_bar)
-        self.spec_bar_widget.setFixedHeight(30)
+        self.spec_bar_widget.setFixedHeight(ui_px(30))
         self.spec_bar_widget.hide()
 
         self.right_panel.setLayout(self.right_layout)
@@ -1584,7 +1778,7 @@ class ViewerWindow(QMainWindow):
         secondary_bar.addWidget(self.spec_bar_widget)
         secondary_bar_widget = QWidget()
         secondary_bar_widget.setLayout(secondary_bar)
-        secondary_bar_widget.setFixedHeight(34)
+        secondary_bar_widget.setFixedHeight(ui_px(34))
         main_layout.addWidget(secondary_bar_widget)
 
         main_layout.addWidget(self.splitter, stretch=1)
@@ -1592,7 +1786,7 @@ class ViewerWindow(QMainWindow):
         # ── Status bar ─────────────────────────────────────────────────
         self.status_bar = self.statusBar()
         self.status_bar.setStyleSheet(
-            "QStatusBar { background: #2b2b2b; color: #aaa; font-size: 11px; border-top: 1px solid #444; }"
+            f"QStatusBar {{ background: #2b2b2b; color: #aaa; {ui_font_css('small')} border-top: 1px solid #444; }}"
             "QStatusBar::item { border: none; }"
         )
         self._sb_file    = QLabel("No file loaded")
@@ -2138,9 +2332,9 @@ class ViewerWindow(QMainWindow):
             y_labels = [self.decimal_to_sexagesimal(float(d), is_ra=False) for d in dec_vals]
 
             self.ax.set_xticks(x_pix)
-            self.ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=7)
+            self.ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=ui_fs(7))
             self.ax.set_yticks(y_pix)
-            self.ax.set_yticklabels(y_labels, fontsize=7)
+            self.ax.set_yticklabels(y_labels, fontsize=ui_fs(7))
             self.ax.set_xlabel('RA (J2000)')
             self.ax.set_ylabel('Dec (J2000)')
         except Exception as e:
@@ -2153,7 +2347,7 @@ class ViewerWindow(QMainWindow):
         """Open dialog to select/fetch an HST background image and adjust its display."""
         dialog = QDialog(self)
         dialog.setWindowTitle('Background Image')
-        dialog.setMinimumWidth(380)
+        dialog.setMinimumWidth(ui_px(380))
         layout = QVBoxLayout(dialog)
         layout.setSpacing(6)
 
@@ -2161,14 +2355,14 @@ class ViewerWindow(QMainWindow):
         layout.addWidget(QLabel('Select HST HiPS band:'))
         _hips_i = 'https://alaskybis.cds.unistra.fr/HST-hips/filter_I_hips/'
         _hips_b = 'https://alaskybis.cds.unistra.fr/HST-hips/filter_B_hips/'
-        i_btn   = QPushButton('HST  I-band');  i_btn.setFixedHeight(30)
-        b_btn   = QPushButton('HST  B-band');  b_btn.setFixedHeight(30)
+        i_btn   = QPushButton('HST  I-band');  i_btn.setFixedHeight(ui_px(30))
+        b_btn   = QPushButton('HST  B-band');  b_btn.setFixedHeight(ui_px(30))
         # Reference the CXC HiPS by its Aladin HiPS ID; the CDS hips2fits service
         # resolves it to a fast mirror (~0.8 s vs ~4.7 s hitting the Harvard FTP
         # host). 903.9 sq deg coverage, PNG/RGB tiles.
         _hips_cxo = 'cxc.harvard.edu/P/cda/hips/allsky/rgb'
-        cxo_btn = QPushButton('Chandra X-ray (broadband RGB)'); cxo_btn.setFixedHeight(30)
-        clr_btn = QPushButton('Clear background'); clr_btn.setFixedHeight(26)
+        cxo_btn = QPushButton('Chandra X-ray (broadband RGB)'); cxo_btn.setFixedHeight(ui_px(30))
+        clr_btn = QPushButton('Clear background'); clr_btn.setFixedHeight(ui_px(26))
         layout.addWidget(i_btn)
         layout.addWidget(b_btn)
         layout.addWidget(cxo_btn)
@@ -2229,7 +2423,7 @@ class ViewerWindow(QMainWindow):
         bkg_bright_slider = QtWidgets.QSlider(Qt.Horizontal)
         bkg_bright_slider.setRange(-100, 100)
         bkg_bright_slider.setValue(int(getattr(self, '_bkg_brightness', 0.0) * 100))
-        bkg_bright_slider.setFixedHeight(20)
+        bkg_bright_slider.setFixedHeight(ui_px(20))
         bright_row.addWidget(bkg_bright_slider)
         layout.addLayout(bright_row)
 
@@ -2239,7 +2433,7 @@ class ViewerWindow(QMainWindow):
         bkg_contrast_slider = QtWidgets.QSlider(Qt.Horizontal)
         bkg_contrast_slider.setRange(10, 300)
         bkg_contrast_slider.setValue(int(getattr(self, '_bkg_contrast', 1.0) * 100))
-        bkg_contrast_slider.setFixedHeight(20)
+        bkg_contrast_slider.setFixedHeight(ui_px(20))
         contrast_row.addWidget(bkg_contrast_slider)
         layout.addLayout(contrast_row)
 
@@ -2270,10 +2464,10 @@ class ViewerWindow(QMainWindow):
             sp.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
             sp.setAlignment(Qt.AlignCenter)
             sp.setStyleSheet(_nudge_spin_qss)
-            sp.setFixedHeight(24)
+            sp.setFixedHeight(ui_px(24))
             minus = QPushButton('−'); plus = QPushButton('+')
             for b in (minus, plus):
-                b.setFixedSize(24, 24)
+                b.setFixedSize(ui_px(24), ui_px(24))
                 b.setStyleSheet(_nudge_btn_qss)
             minus.setToolTip(tip); plus.setToolTip(tip)
             minus.clicked.connect(lambda: sp.setValue(sp.value() - 1))
@@ -2300,7 +2494,7 @@ class ViewerWindow(QMainWindow):
         # restored. See _lock_in_wcs.
         lock_row = QHBoxLayout()
         lock_btn = QPushButton('💾 Update cube WCS from alignment')
-        lock_btn.setFixedHeight(26)
+        lock_btn.setFixedHeight(ui_px(26))
         lock_btn.setToolTip('Apply the Align X/Y shift to the cube FITS WCS so '
                             'the cube is registered to the background '
                             '(saves a backup of the original WCS first)')
@@ -2311,7 +2505,7 @@ class ViewerWindow(QMainWindow):
         )
         lock_row.addWidget(lock_btn)
         restore_btn = QPushButton('↩ Revert cube WCS to original')
-        restore_btn.setFixedHeight(26)
+        restore_btn.setFixedHeight(ui_px(26))
         restore_btn.setToolTip('Undo the WCS update — restore the cube WCS from the saved backup')
         restore_btn.setStyleSheet(
             "QPushButton { background-color:#3c3f41; color:#eff0f1; border:1px solid #666;"
@@ -2837,12 +3031,12 @@ class ViewerWindow(QMainWindow):
             # Fallback to text if image can't be loaded
             ax.text(0.5, 0.55, 'HYPERCUBE',
                     transform=ax.transAxes, ha='center', va='center',
-                    fontsize=28, fontweight='bold', color='#d7801a',
+                    fontsize=ui_fs(28), fontweight='bold', color='#d7801a',
                     fontfamily='monospace')
 
         ax.text(0.5, 0.1, 'Open a FITS file to begin',
                 transform=ax.transAxes, ha='center', va='center',
-                fontsize=11, color='#888888')
+                fontsize=ui_fs(11), color='#888888')
 
         fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
         self.canvas.draw()
@@ -3584,7 +3778,7 @@ class ViewerWindow(QMainWindow):
         """Create a dialog for selecting wavelength and flux columns from bintable"""
         dialog = QDialog(self)
         dialog.setWindowTitle("Select Table Columns")
-        dialog.setMinimumWidth(500)  # Slightly wider for better button spacing
+        dialog.setMinimumWidth(ui_px(500))  # Slightly wider for better button spacing
         
         layout = QVBoxLayout()
         info_label = QLabel("This FITS file contains multiple columns. Please select:")
@@ -3848,7 +4042,7 @@ class ViewerWindow(QMainWindow):
             current_name = str(df_obs.loc[0, 'sourcename']) if len(df_obs) > 0 else ''
             dialog = QDialog(self)
             dialog.setWindowTitle('Source Information')
-            dialog.setMinimumWidth(420)
+            dialog.setMinimumWidth(ui_px(420))
             layout = QVBoxLayout(dialog)
             layout.setSpacing(10)
             layout.addWidget(QLabel('Source name:'))
@@ -4087,7 +4281,7 @@ class ViewerWindow(QMainWindow):
                     0.01, 0.99, '',
                     transform=self.spectrum_ax.transAxes,
                     verticalalignment='top', horizontalalignment='left',
-                    fontsize=8, color='white',
+                    fontsize=ui_fs(8), color='white',
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.5, edgecolor='none')
                 )
 
@@ -4103,7 +4297,7 @@ class ViewerWindow(QMainWindow):
                 self.spec_hbar.setValue(500)
                 self.spec_hbar.setSingleStep(10)
                 self.spec_hbar.setPageStep(100)
-                self.spec_hbar.setFixedHeight(14)
+                self.spec_hbar.setFixedHeight(ui_px(14))
                 self.spec_hbar.setStyleSheet(
                     "QScrollBar:horizontal { height: 14px; }"
                     "QScrollBar::handle:horizontal { min-width: 30px; }"
@@ -4183,7 +4377,7 @@ class ViewerWindow(QMainWindow):
         wav0, wav1 = self._span_x_extent(self._chanmap_span)
         xform = self.spectrum_ax.get_xaxis_transform()  # x: data coords, y: axes [0,1]
 
-        kw = dict(transform=xform, va='top', fontsize=9,
+        kw = dict(transform=xform, va='top', fontsize=ui_fs(9),
                   color='#4fc3f7', fontweight='bold', clip_on=True,
                   zorder=10)
         self._chanmap_handle_left  = self.spectrum_ax.text(
@@ -4697,7 +4891,7 @@ class ViewerWindow(QMainWindow):
         self._clear_spectrum_hint()
         self._spectrum_hint_artist = ax.text(
             0.5, 0.98, text, transform=ax.transAxes, ha='center', va='top',
-            fontsize=9, color='#ffd54f', zorder=10,
+            fontsize=ui_fs(9), color='#ffd54f', zorder=10,
             bbox=dict(boxstyle='round,pad=0.3', facecolor='black',
                       alpha=0.65, edgecolor='#ffd54f'))
         if getattr(self, 'spectrum_canvas', None) is not None:
@@ -5766,7 +5960,7 @@ class ViewerWindow(QMainWindow):
             0.01, 0.99, '',
             transform=self.ax.transAxes,
             verticalalignment='top', horizontalalignment='left',
-            fontsize=8, color='white',
+            fontsize=ui_fs(8), color='white',
             bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.5, edgecolor='none')
         )
         # Restore background image overlay if one was loaded
@@ -5909,6 +6103,8 @@ class ViewerWindow(QMainWindow):
         view_menu = menu_bar.addMenu("View")
         view_menu.addAction(QAction("Zoom In", self))
         view_menu.addAction(QAction("Zoom Out", self))
+        view_menu.addSeparator()
+        add_ui_scale_menu(self, view_menu)
 
         # Help Menu
         help_menu = menu_bar.addMenu("Help")
@@ -6061,9 +6257,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.fit_progress_label.setStyleSheet('font-weight: bold;')
         self.fit_progress_bar = QProgressBar()
         self.fit_progress_bar.setTextVisible(True)
-        self.fit_progress_bar.setFixedHeight(18)
+        self.fit_progress_bar.setFixedHeight(ui_px(18))
         self.fit_cancel_button = QPushButton('Cancel')
-        self.fit_cancel_button.setFixedHeight(20)
+        self.fit_cancel_button.setFixedHeight(ui_px(20))
         self.fit_cancel_button.setToolTip('Stop the in-progress cube fit')
         self.fit_cancel_button.clicked.connect(self._cancel_running_fit)
         _pf.addWidget(self.fit_progress_label)
@@ -6124,6 +6320,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         view_menu = menu_bar.addMenu("View")
         view_menu.addAction(QAction("Zoom In", self))
         view_menu.addAction(QAction("Zoom Out", self))
+        view_menu.addSeparator()
+        add_ui_scale_menu(self, view_menu)
 
         # Help Menu
         help_menu = menu_bar.addMenu("Help")
@@ -6355,7 +6553,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f'Edit spline knots — region {regionID + 1}')
-        dlg.setMinimumWidth(320)
+        dlg.setMinimumWidth(ui_px(320))
         v = QVBoxLayout(dlg)
         v.addWidget(QLabel('Knot positions (wavelength x, flux y). '
                            'Initial guess for the fit.'))
@@ -6662,7 +6860,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # Disabled in edit mode to preserve the locked schema (same lines
             # everywhere) so line maps stay hole-free.
             del_line_btn = FrameButton('x', row, len(button_columns), regionID, f'del_line_{line_id}')
-            del_line_btn.setFixedHeight(24)
+            del_line_btn.setFixedHeight(ui_px(24))
             del_line_btn.setStyleSheet("background-color: lightcoral; color: black;")
             if self._edit_mode():
                 del_line_btn.setEnabled(False)
@@ -7004,7 +7202,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         def _cat_label(text):
             lab = QLabel(text)
-            lab.setStyleSheet('color: gray; font-size: 11px;')
+            lab.setStyleSheet(f'color: gray; {ui_font_css("small")}')
             return lab
 
         def _vsep():
@@ -7026,7 +7224,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for btn in [self.source_name_button,
                     self.source_redshift_button,
                     self.resolving_power_button]:
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(ui_px(28))
             row1.addWidget(btn)
 
         self.source_name_button.clicked.connect(
@@ -7071,7 +7269,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for btn in [self.fit_spaxel_button, self.clear_spaxel_fit_button,
                     self.cancel_edit_button, self.toggle_edited_button,
                     self.stellar_template_button]:
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(ui_px(28))
             row1.addWidget(btn)
         row1.addStretch()
         vbox.addLayout(row1)
@@ -7123,7 +7321,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for btn in [self.smart_constraints_button, self.meas_errors_button,
                     self.fit_cube_button, self.fix_fit_button,
                     self.rchisq_map_button, self.mask_button, self.clear_all_fits_button]:
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(ui_px(28))
             row2.addWidget(btn)
 
         # Sequential core→outflow fit toggle (no effect unless narrow/broad pairs exist)
@@ -7150,7 +7348,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         _ncpu = os.cpu_count() or 2
         self._cores_spin.setRange(1, max(1, _ncpu))
         self._cores_spin.setValue(max(1, _ncpu - 1))
-        self._cores_spin.setFixedHeight(28)
+        self._cores_spin.setFixedHeight(ui_px(28))
         self._cores_spin.setToolTip(
             'Worker processes for "Fit Cube" (1 = serial). Each spaxel\'s full\n'
             'model fit (continuum + lines across all regions) runs on its own\n'
@@ -7161,7 +7359,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         # ── + Spectral Region ───────────────────────────────────────────────
         self.add_region_button = QPushButton('+ Region')
-        self.add_region_button.setFixedHeight(28)
+        self.add_region_button.setFixedHeight(ui_px(28))
         if self._edit_mode():
             self.add_region_button.setEnabled(False)
             self.add_region_button.setToolTip('Disabled while editing a single spaxel (schema is locked)')
@@ -7196,7 +7394,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for btn in [self.save_cube_fit_button, self.save_cube_fit_fitsfile_button,
                     self.load_cube_fit_button, self.save_session_button,
                     self.load_session_button]:
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(ui_px(28))
             row3.addWidget(btn)
         row3.addStretch()
         vbox.addLayout(row3)
@@ -7424,7 +7622,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Rectify Bad Fits')
-        dlg.setMinimumWidth(470)
+        dlg.setMinimumWidth(ui_px(470))
         layout = QVBoxLayout(dlg)
         layout.setSpacing(10)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -7441,7 +7639,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # ── Row: "[op combo]  [threshold spin]" ───────────────────────────
         thresh_row = QHBoxLayout()
         op_combo = QComboBox()
-        op_combo.setFixedWidth(80)
+        op_combo.setFixedWidth(ui_px(80))
         for disp, _tok in OPS:
             op_combo.addItem(disp)
         thresh_row.addWidget(op_combo)
@@ -7547,7 +7745,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # ── Button row ────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         help_btn = QPushButton('?')
-        help_btn.setFixedWidth(28)
+        help_btn.setFixedWidth(ui_px(28))
         help_btn.setToolTip('Explain the maps, operators and thresholds')
         help_btn.clicked.connect(
             lambda: QMessageBox.information(dlg, 'Rectify — Help', HELP))
@@ -7626,7 +7824,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Mask Spaxels')
-        dlg.setMinimumWidth(470)
+        dlg.setMinimumWidth(ui_px(470))
         layout = QVBoxLayout(dlg)
         layout.setSpacing(10)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -7643,7 +7841,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # ── Row: "[op combo]  [threshold spin]" ───────────────────────────
         thresh_row = QHBoxLayout()
         op_combo = QComboBox()
-        op_combo.setFixedWidth(80)
+        op_combo.setFixedWidth(ui_px(80))
         for disp, _tok in OPS:
             op_combo.addItem(disp)
         thresh_row.addWidget(op_combo)
@@ -7733,7 +7931,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # ── Button row: ? | Visualize | Accept | Unmask | Cancel ──────────
         btn_row = QHBoxLayout()
         help_btn = QPushButton('?')
-        help_btn.setFixedWidth(28)
+        help_btn.setFixedWidth(ui_px(28))
         help_btn.setToolTip('Explain masking, maps and operators')
         help_btn.clicked.connect(
             lambda: QMessageBox.information(dlg, 'Mask — Help', HELP))
@@ -8147,7 +8345,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         note = QLabel(
             'Spaxels already fitted keep the uncertainties they were fitted with; '
             're-fit to apply a change.')
-        note.setStyleSheet('color: gray; font-size: 11px;')
+        note.setStyleSheet(f'color: gray; {ui_font_css("small")}')
         lay.addWidget(note)
 
         def repopulate():
@@ -9101,7 +9299,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Smart Constraints')
-        dlg.setMinimumWidth(500)
+        dlg.setMinimumWidth(ui_px(500))
         v = QVBoxLayout(dlg)
 
         # ── Scenario ─────────────────────────────────────────────────────
@@ -9129,7 +9327,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         ion_row = QHBoxLayout()
         ion_cb = QCheckBox('Split secondary K-group by ionization potential, threshold (eV):', dlg)
         ion_edit = QLineEdit(str(hcsc.DEFAULT_IP_THRESHOLD_EV), dlg)
-        ion_edit.setFixedWidth(60)
+        ion_edit.setFixedWidth(ui_px(60))
         ion_row.addWidget(ion_cb); ion_row.addWidget(ion_edit); ion_row.addStretch()
         v.addLayout(ion_row)
 
@@ -9163,7 +9361,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'automatically when both lines are present (set by atomic transition '
             'probabilities, not gas conditions) — not affected by these toggles.', dlg)
         note.setWordWrap(True)
-        note.setStyleSheet('color: gray; font-size: 11px;')
+        note.setStyleSheet(f'color: gray; {ui_font_css("small")}')
         v.addWidget(note)
 
         def _apply_scenario_defaults():
@@ -9191,7 +9389,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         v.addWidget(QLabel('<b>Preview:</b>'))
         preview_box = QTextEdit(dlg)
         preview_box.setReadOnly(True)
-        preview_box.setMinimumHeight(160)
+        preview_box.setMinimumHeight(ui_px(160))
         v.addWidget(preview_box)
 
         state = {'plan': None}
@@ -9243,7 +9441,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         brow = QHBoxLayout()
         help_btn = QPushButton('?', dlg)
-        help_btn.setFixedSize(22, 22)
+        help_btn.setFixedSize(ui_px(22), ui_px(22))
         help_btn.setToolTip('What Smart Constraints does')
         help_btn.clicked.connect(lambda: self._show_smart_constraints_help(dlg))
         preview_btn = QPushButton('Preview', dlg)
@@ -9315,7 +9513,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         )
         d = QDialog(parent)
         d.setWindowTitle('Smart Constraints — Help')
-        d.setMinimumWidth(380)
+        d.setMinimumWidth(ui_px(380))
         lay = QVBoxLayout(d)
         lbl = QLabel(text, d)
         lbl.setWordWrap(True)
@@ -9368,7 +9566,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for nm in names:
             combo.addItem(f"{libs[nm]['label']}  ({libs[nm]['n_files']} spectra)", nm)
         v.addWidget(combo)
-        info = QLabel(''); info.setStyleSheet('color: gray; font-size: 11px;')
+        info = QLabel(''); info.setStyleSheet(f'color: gray; {ui_font_css("small")}')
         info.setWordWrap(True)
         v.addWidget(info)
 
@@ -10547,7 +10745,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         frame.setFrameShape(QFrame.StyledPanel)
         frame.setFrameShadow(QFrame.Raised)
         frame.setObjectName(f"frame_{ID}")
-        frame.setMinimumWidth(0)
+        frame.setMinimumWidth(ui_px(0))
         frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
         frame_layout = QVBoxLayout(frame)
@@ -10561,7 +10759,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         title_lbl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         title_row.addWidget(title_lbl)
         del_btn = QPushButton("✕")
-        del_btn.setFixedSize(22, 22)
+        del_btn.setFixedSize(ui_px(22), ui_px(22))
         del_btn.setStyleSheet("background-color: lightcoral; color: black;")
         if self._edit_mode():
             del_btn.setEnabled(False)
@@ -10591,7 +10789,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         # ── + Line button ───────────────────────────────────────────────────
         add_line_btn = QPushButton('+ Line')
-        add_line_btn.setFixedHeight(26)
+        add_line_btn.setFixedHeight(ui_px(26))
         if self._edit_mode():
             add_line_btn.setEnabled(False)
             add_line_btn.setToolTip('Disabled while editing a single spaxel (schema is locked)')
@@ -10885,7 +11083,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             else:
                 button_text = str(df_region.iloc[last_row_idx][col_name])
             btn = FrameButton(button_text, last_row_idx, col, frame_id, button_name)
-            btn.setFixedHeight(24)
+            btn.setFixedHeight(ui_px(24))
             if 'fit' in col_name:
                 btn.clicked.connect(partial(self.on_fit_button_click, frame_id=frame_id, button_name=button_name))
             else:
@@ -10901,7 +11099,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # Delete button at rightmost position of the new line row
         new_line_id = np.int64(df_region.iloc[last_row_idx]['Line_ID'])
         del_btn = FrameButton('x', last_row_idx, len(button_columns), frame_id, f'del_line_{new_line_id}')
-        del_btn.setFixedHeight(24)
+        del_btn.setFixedHeight(ui_px(24))
         del_btn.setStyleSheet("background-color: lightcoral; color: black;")
         del_btn.clicked.connect(partial(self.on_deleteline_button_click, frame_id=frame_id, line_id=new_line_id))
         grid_layout.addWidget(del_btn, grid_row, len(button_columns))
@@ -10930,7 +11128,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle('Source Information')
-        dialog.setMinimumWidth(420)
+        dialog.setMinimumWidth(ui_px(420))
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
 
@@ -11289,7 +11487,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     
                 # Create the confirmation label (green checkmark) and hide it initially
                 confirm_label = QLabel('✔️', dialog)
-                confirm_label.setStyleSheet("color: limegreen; font-size: 16px;")
+                confirm_label.setStyleSheet(f"color: limegreen; {ui_font_css('header')}")
                 confirm_label.hide()
     
                 # Add the checkmark and ensure it's right next to the label
@@ -11324,7 +11522,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 constraints_header.addWidget(label_constraints)
                 constraints_header.addStretch()
                 help_btn = QPushButton('?', dialog)
-                help_btn.setFixedSize(22, 22)
+                help_btn.setFixedSize(ui_px(22), ui_px(22))
                 help_btn.setToolTip('Constraint syntax help')
                 help_btn.clicked.connect(lambda: self._show_constraints_help(dialog, current_line_names))
                 constraints_header.addWidget(help_btn)
@@ -11406,7 +11604,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 kgroup_header.addWidget(kgroup_label)
                 kgroup_header.addStretch()
                 kgroup_help = QPushButton('?', dialog)
-                kgroup_help.setFixedSize(22, 22)
+                kgroup_help.setFixedSize(ui_px(22), ui_px(22))
                 kgroup_help.setToolTip('What are kinematic groups?')
                 kgroup_help.clicked.connect(lambda: QMessageBox.information(
                     dialog, 'Kinematic Groups',
@@ -11434,7 +11632,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # Status line that surfaces the group's reference (anchor) line
                 kgroup_ref_label = QLabel('', dialog)
                 kgroup_ref_label.setWordWrap(True)
-                kgroup_ref_label.setStyleSheet('color: gray; font-size: 11px;')
+                kgroup_ref_label.setStyleSheet(f'color: gray; {ui_font_css("small")}')
                 layout.addWidget(kgroup_ref_label)
 
                 def _refresh_kgroup_label():
@@ -11572,7 +11770,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         )
         dlg = QDialog(parent)
         dlg.setWindowTitle('Constraint Syntax Help')
-        dlg.setMinimumWidth(380)
+        dlg.setMinimumWidth(ui_px(380))
         lay = QVBoxLayout(dlg)
         lbl = QLabel(text, dlg)
         lbl.setWordWrap(True)
@@ -12131,7 +12329,7 @@ def load_stylesheet(app,filename):
         
         with open(stylesheet_path, "r") as f:
             style = f.read()
-            app.setStyleSheet(style)
+            app.setStyleSheet(scale_stylesheet(style))
     except Exception as e:
         print(f"Error loading stylesheet: {e}")
         # Fallback to basic dark theme
@@ -12145,7 +12343,10 @@ def load_stylesheet(app,filename):
 def main():
     """Entry point for Hypercube spectral analysis tool."""
     try:
+        # High-DPI scaling must be requested before the QApplication exists.
+        enable_high_dpi()
         app = QApplication(sys.argv)
+        init_ui_scale(app)
         load_stylesheet(app, 'QDarkOrange_style.qss')
         
         
