@@ -4,8 +4,11 @@
 Created on Fri Mar 28 15:01:22 2025
 
 @author: justin
-   __version__ = "0.2.0"
 """
+
+# Real module attribute (it used to sit inside the docstring, where nothing could
+# read it and it went stale). Keep in step with CHANGELOG.md and the git tag.
+__version__ = "0.4.0"
 
 
 
@@ -38,7 +41,7 @@ from PyQt5.QtWidgets import (
     QWidget, QLabel, QFrame, QMenu, QTextEdit, QMainWindow,
     QHBoxLayout, QMenuBar, QProgressBar, QDialog, QSplashScreen,
     QAction, QSplitter, QFileDialog, QApplication, QGroupBox, QMessageBox,
-    QDockWidget, QComboBox, QScrollBar, QCheckBox)
+    QDockWidget, QComboBox, QScrollBar, QCheckBox, QRadioButton, QButtonGroup)
 from PyQt5.QtGui import QFontMetrics, QPixmap
 from PyQt5.QtGui import QKeySequence
 
@@ -46,6 +49,8 @@ from lmfit import Model, Parameters
 
 import HyperCube_ModelFunctions
 import HyperCube_fit  # Qt-free per-spaxel fit kernel (shared by serial + parallel)
+import HyperCube_Noise  # Qt-free variance/error-cube discovery + empirical noise
+import HyperCube_SmartConstraints as hcsc  # Qt-free auto-constraint/K-group logic
 try:
     import HyperCube_pPXF as hcppxf
 except Exception as _e:
@@ -62,6 +67,16 @@ except Exception as _e:
 global FITS_HEADER, FITS_DATA
 FITS_HEADER = None
 FITS_DATA = None
+
+# ── Measurement errors ───────────────────────────────────────────────────────
+# ERROR_CUBE holds per-pixel 1σ flux uncertainties with the same shape as
+# FITS_DATA (converted from whatever the file stores — variance, error or
+# inverse variance), or None when no error cube is in use, in which case each
+# spaxel's noise is measured empirically from its own line-free continuum.
+# ERROR_INFO records where it came from, for the fit output and the dialog.
+global ERROR_CUBE, ERROR_INFO
+ERROR_CUBE = None
+ERROR_INFO = {'source': HyperCube_Noise.SRC_EMPIRICAL, 'mode': 'empirical'}
 
 global viewing_fit
 viewing_fit = False
@@ -213,6 +228,185 @@ def sigma_kms_to_wl(sigma_kms, centroid_wl):
     if not np.isfinite(sigma_kms) or not np.isfinite(centroid_wl):
         return np.nan
     return sigma_kms * centroid_wl / C_KMS
+
+
+# ── CSV column units ─────────────────────────────────────────────────────────
+# Every exported CSV column that has a physical unit carries that unit in its
+# name, and σ is exported as a velocity dispersion (km/s) everywhere (the Å value
+# stays recoverable from the companion centroid column). Flux-like quantities
+# carry a generic '_flux' token because their true unit is the cube's BUNIT,
+# which is written into the CSV's scale/units header block instead.
+#
+#   _A         Angstrom            _kms   km/s
+#   _flux      cube flux unit      _fluxperA  cube flux unit per Angstrom
+#   _deg       degrees             _pix   spaxel index (pixels)
+#
+# `to_export_units()` renames + converts on the way out; `from_export_units()`
+# inverts it on the way in and still accepts the pre-units CSVs written by
+# earlier versions (σ in Å, with derived *_kms companions).
+UNIT_SUFFIXES = ('_fluxperA', '_flux', '_kms', '_deg', '_pix', '_A')
+
+# σ columns stored internally in Å → exported in km/s using this centroid column.
+SIGMA_KMS_PAIRS = (
+    ('Sigma_0', 'Centroid_0'),
+    ('Sigma_0_lowlim', 'Centroid_0'),
+    ('Sigma_0_highlim', 'Centroid_0'),
+    ('Sigma_fit', 'Centroid_fit'),
+    ('sigma_init', 'cen_init'),
+    ('sigma_fit', 'cen_fit'),
+    ('sigma_std', 'cen_fit'),
+)
+_SIGMA_COLS = {c for c, _ in SIGMA_KMS_PAIRS}
+
+_COL_UNITS = {
+    # df_fit — per-spaxel fit results
+    'spaxel_x': 'pix', 'spaxel_y': 'pix', 'RA': 'deg', 'Dec': 'deg',
+    'amp_init': 'flux', 'amp_fit': 'flux', 'amp_std': 'flux',
+    'cen_init': 'A', 'cen_fit': 'A', 'cen_std': 'A',
+    'vel_init': 'kms', 'vel_fit': 'kms', 'vel_std': 'kms',
+    'rest_wavelength': 'A',
+    'sigma_init': 'kms', 'sigma_fit': 'kms', 'sigma_std': 'kms',
+    'noise_median': 'flux', 'qa_noise': 'flux',
+    # df — line definitions / initial guesses
+    'Rest Wavelength': 'A',
+    'Amp_0': 'flux', 'Amp_0_lowlim': 'flux', 'Amp_0_highlim': 'flux', 'Amp_fit': 'flux',
+    'Centroid_0': 'A', 'Centroid_0_lowlim': 'A', 'Centroid_0_highlim': 'A',
+    'Centroid_fit': 'A',
+    'Sigma_0': 'kms', 'Sigma_0_lowlim': 'kms', 'Sigma_0_highlim': 'kms', 'Sigma_fit': 'kms',
+    # df_cont — continuum regions
+    'x1': 'A', 'x2': 'A', 'knots_x': 'A',
+    'Slope_0': 'fluxperA', 'Slope_fit': 'fluxperA',
+    'Intercept_0': 'flux', 'Intercept_fit': 'flux',
+    'knots_y_0': 'flux', 'knots_y_fit': 'flux',
+    'poly_coef_0': 'flux', 'poly_coef_fit': 'flux',
+    'stellar_V_0': 'kms', 'stellar_V_fit': 'kms',
+    'stellar_sigma_0': 'kms', 'stellar_sigma_fit': 'kms',
+    # df_stellar — per-spaxel stellar kinematics (pPXF returns km/s already)
+    'stellar_V': 'kms', 'stellar_sigma': 'kms',
+}
+
+# Units for the per-region columns of df_fit, keyed on the part after
+# 'cont_region{N}_'.
+_CONT_COL_UNITS = {
+    'x_start': 'A', 'x_end': 'A', 'x_int_start': 'A', 'x_int_end': 'A',
+    'slope_init': 'fluxperA', 'slope_fit': 'fluxperA',
+    'slope_int_init': 'fluxperA', 'slope_int_fit': 'fluxperA',
+    'intercept_init': 'flux', 'intercept_fit': 'flux',
+    'poly_coef_init': 'flux', 'poly_coef_fit': 'flux',
+    'knots_x': 'A', 'knots_y_init': 'flux', 'knots_y_fit': 'flux',
+    'stellar_V': 'kms', 'stellar_sigma': 'kms',
+}
+
+_CONT_RE = re.compile(r'^(cont_region\d+_)(.+)$')
+
+
+def csv_unit_for(col):
+    """Unit token for an internal column name, or None if it is dimensionless."""
+    col = str(col)
+    if col in _COL_UNITS:
+        return _COL_UNITS[col]
+    m = _CONT_RE.match(col)
+    if m:
+        return _CONT_COL_UNITS.get(m.group(2))
+    return None
+
+
+def to_export_units(frame):
+    """Copy of `frame` with σ converted to km/s and units appended to names."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty and not len(frame.columns):
+        return frame
+    out = frame.copy()
+    for sig_col, cen_col in SIGMA_KMS_PAIRS:
+        if sig_col in out.columns and cen_col in out.columns:
+            out[sig_col] = [sigma_wl_to_kms(s, c)
+                            for s, c in zip(out[sig_col], out[cen_col])]
+    renames = {}
+    for col in out.columns:
+        unit = csv_unit_for(col)
+        if unit:
+            renames[col] = f'{col}_{unit}'
+    return out.rename(columns=renames)
+
+
+def from_export_units(frame):
+    """Inverse of `to_export_units`: strip unit suffixes and put σ back in Å.
+
+    Also accepts the older layout (σ in Å plus derived *_kms companions), which
+    is detected by a σ column being present both with and without '_kms'.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        return frame
+    cols = list(frame.columns)
+    out = frame.copy()
+
+    # Old layout: '*_kms' sat alongside the canonical Å column → drop the copy.
+    legacy = [c for c in cols
+              if str(c).endswith('_kms') and str(c)[:-4] in cols and str(c)[:-4] in _SIGMA_COLS]
+    if legacy:
+        out = out.drop(columns=legacy)
+
+    renames, to_angstrom = {}, []
+    for col in out.columns:
+        name = str(col)
+        for suf in UNIT_SUFFIXES:
+            if not name.endswith(suf):
+                continue
+            base = name[:-len(suf)]
+            if csv_unit_for(base) is None:
+                continue                      # not a column we renamed — leave it
+            renames[col] = base
+            if suf == '_kms' and base in _SIGMA_COLS:
+                to_angstrom.append(base)
+            break
+    out = out.rename(columns=renames)
+    for sig_col in to_angstrom:
+        cen_col = dict(SIGMA_KMS_PAIRS)[sig_col]
+        if cen_col in out.columns:
+            out[sig_col] = [sigma_kms_to_wl(s, c)
+                            for s, c in zip(out[sig_col], out[cen_col])]
+    return out
+
+
+def sigma_at_spaxel(cx, cy):
+    """This spaxel's 1σ measurement errors from ERROR_CUBE, or None if no error
+    cube is loaded (the fit then measures the noise empirically)."""
+    if ERROR_CUBE is None:
+        return None
+    try:
+        if ERROR_CUBE.ndim == 1:                     # 1D spectrum
+            return np.asarray(ERROR_CUBE, dtype=float)
+        y = int(np.clip(cy, 0, ERROR_CUBE.shape[1] - 1))
+        x = int(np.clip(cx, 0, ERROR_CUBE.shape[2] - 1))
+        return np.asarray(ERROR_CUBE[:, y, x], dtype=float)
+    except Exception:
+        return None
+
+
+def noise_source_label():
+    """Short provenance token for the fit output's `noise_source` column."""
+    if ERROR_CUBE is None:
+        return None
+    return str(ERROR_INFO.get('source') or 'error-cube')
+
+
+def set_error_cube(sigma, info):
+    """Install (or clear, with sigma=None) the measurement-error cube."""
+    global ERROR_CUBE, ERROR_INFO
+    ERROR_CUBE = sigma
+    ERROR_INFO = dict(info or {})
+    if sigma is None:
+        ERROR_INFO.setdefault('mode', 'empirical')
+        ERROR_INFO.setdefault('source', HyperCube_Noise.SRC_EMPIRICAL)
+
+
+def flux_unit_str(header=None):
+    """The cube's flux unit (BUNIT) for the CSV units block; 'unknown' if absent."""
+    hdr = header if header is not None else FITS_HEADER
+    try:
+        bunit = str(hdr.get('BUNIT', '')).strip() if hdr is not None else ''
+    except Exception:
+        bunit = ''
+    return bunit or 'unknown'
 
 
 def convert_velocity_to_centroid(velocity_constraint, line_name, df, galaxy_redshift):
@@ -410,6 +604,97 @@ def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
     return True
 
 
+def _apply_flux_constraint(found_op, right_side, line_id, df, params):
+    """Constrain a line's integrated Gaussian FLUX relative to another line's.
+
+    There is no `flux` parameter — flux = amp · σ · √(2π), so a flux relation is
+    realised as an amplitude expression carrying the σ ratio:
+
+        flux_A == k · flux_B   →   amp_A = k · amp_B · σ_B / σ_A
+
+    Because it uses the *fitted* σ's, the flux ratio is exact even when the two
+    lines have different or freely-varying widths (the √(2π) cancels). Useful for
+    fixed atomic ratios, e.g. [N II] 6584/6548 = 2.94.
+
+    Recognised right-hand side:  [factor *] flux_[OtherLine], where `factor` is a
+    single number (==, <=/<, >=/>) or a `lo..hi` RANGE for a two-sided bound, e.g.
+    the density-sensitive [S II] doublet  flux == 0.44..1.45 * flux_[[S II]_6731].
+    Returns True if applied, False otherwise.
+    """
+    if '_[' not in right_side or ']' not in right_side:
+        return False
+    ref_name = _ref_line_name(right_side)
+    if ref_name is None:
+        return False
+    amp_self, sig_self = f'amp{line_id + 1}', f'sigma{line_id + 1}'
+    if amp_self not in params or sig_self not in params:
+        return False
+    try:
+        other = df[df['Line_Name'] == ref_name].iloc[0]
+        oid = int(other['Line_ID'])
+    except (IndexError, KeyError, ValueError):
+        return False
+    amp_ref, sig_ref = f'amp{oid + 1}', f'sigma{oid + 1}'
+    if amp_ref not in params or sig_ref not in params:
+        return False
+
+    # Factor token: a single number, OR a 'lo..hi' RANGE for a two-sided
+    # (windowed) flux-ratio bound — e.g. the density-sensitive [S II] doublet
+    # flux_[6716]/flux_[6731] ∈ [0.44, 1.45]. The token is the part of the RHS
+    # that is not the flux_[...] reference.
+    factor_tok = None
+    for tok in (t.strip() for t in right_side.split('*')):
+        if tok and '_[' not in tok:
+            factor_tok = tok
+            break
+    try:
+        if factor_tok is None:
+            lo = hi = 1.0
+        elif '..' in factor_tok:
+            a, b = factor_tok.split('..')
+            lo, hi = float(a), float(b)
+        else:
+            lo = hi = float(factor_tok)
+    except ValueError:
+        return False
+    if lo > hi:
+        lo, hi = hi, lo
+
+    # amp_A = r · amp_B · σ_B/σ_A  ⇒  flux_A/flux_B = r  (the √2π and σ cancel).
+    sigratio = f'{amp_ref} * {sig_ref} / {sig_self}'
+
+    if lo != hi:
+        # Two-sided bound: a single ratio parameter r ∈ [lo, hi] (op ignored).
+        rname = f'fluxr_{amp_self}_{amp_ref}'
+        init = min(max(1.0, lo), hi)
+        if rname not in params:
+            params.add(rname, value=init, min=lo, max=hi, vary=True)
+        else:
+            params[rname].set(value=init, min=lo, max=hi, vary=True)
+        params[amp_self].expr = f'{rname} * {sigratio}'
+        print(f"Flux constraint: flux[{amp_self}]/flux[{amp_ref}] ∈ [{lo:g}, {hi:g}]")
+        return True
+
+    base = f'{lo:.8g} * {sigratio}'      # fixed ratio (lo == hi)
+    if found_op == '==':
+        params[amp_self].expr = base
+    elif found_op in ('<=', '<'):
+        rname = f'fluxr_{amp_self}_{amp_ref}'
+        if rname not in params:
+            params.add(rname, value=0.9, min=0.0, max=1.0, vary=True)
+        params[amp_self].expr = f'{rname} * ({base})'
+    elif found_op in ('>=', '>'):
+        rname = f'fluxr_{amp_ref}_{amp_self}'
+        if rname not in params:
+            params.add(rname, value=0.9, min=0.0, max=1.0, vary=True)
+        params[amp_self].expr = f'({base}) / {rname}'
+    else:
+        return False
+    print(f"Flux constraint: flux[{amp_self}] {found_op} {lo:g}*flux[{amp_ref}] "
+          f"→ {amp_self} = {params[amp_self].expr}")
+    return True
+
+
 def add_dataframe_constraints_to_params(df, params):
     """
     Adds constraints to lmfit Parameters object, using:
@@ -471,6 +756,14 @@ def add_dataframe_constraints_to_params(df, params):
                 if param1_base == 'vel':
                     if not _apply_velocity_constraint(found_op, right_side, line_id, df, params):
                         print(f"Warning: could not parse velocity constraint: {constraint}")
+                    continue
+
+                # FLUX constraints (integrated Gaussian flux). There is no `flux`
+                # parameter — realised as an amplitude expression carrying the σ
+                # ratio (flux = amp·σ·√2π). Handle before the param check.
+                if param1_base == 'flux':
+                    if not _apply_flux_constraint(found_op, right_side, line_id, df, params):
+                        print(f"Warning: could not parse flux constraint: {constraint}")
                     continue
 
                 if param1_name not in params:
@@ -792,7 +1085,7 @@ def _load_line_library():
     Expected columns (exact names):
         wavelength_AA  : float, wavelength in Angstroms (range 770.409 – 10938.086)
         ion            : str,   emission line name
-        IP_eV          : float, ionization potential in eV
+        IP             : float, ionization potential in eV
     """
     global _LINE_LIBRARY
     if _LINE_LIBRARY is not None:
@@ -800,11 +1093,12 @@ def _load_line_library():
     try:
         lib_path = resource_path('LineLibrary.csv')
         _LINE_LIBRARY = pd.read_csv(lib_path,
-                                    dtype={'wavelength_AA': float, 'ion': str, 'IP_eV': float})
+                                    usecols=['wavelength_AA', 'ion', 'IP'],
+                                    dtype={'wavelength_AA': float, 'ion': str, 'IP': float})
         print(f"Loaded line library: {len(_LINE_LIBRARY)} lines from {lib_path}")
     except Exception as e:
         print(f"Could not load LineLibrary.csv: {e}")
-        _LINE_LIBRARY = pd.DataFrame(columns=['wavelength_AA', 'ion', 'IP_eV'])
+        _LINE_LIBRARY = pd.DataFrame(columns=['wavelength_AA', 'ion', 'IP'])
     return _LINE_LIBRARY
 
 
@@ -2815,9 +3109,13 @@ class ViewerWindow(QMainWindow):
         text_box.returnPressed.connect(lambda: self.scale_WL(text_box))
 
     def scale_flux(self,text_box):
-        global FITS_DATA
+        global FITS_DATA, ERROR_CUBE
         self.fluxscalefactor = text_box.text()
         FITS_DATA = FITS_DATA*np.float64(self.fluxscalefactor)
+        # The measurement errors are in the same units as the flux, so they
+        # follow the same rescaling.
+        if ERROR_CUBE is not None:
+            ERROR_CUBE = ERROR_CUBE*np.float64(self.fluxscalefactor)
         text_box.hide()
         
     def scale_WL(self,text_box):
@@ -2939,6 +3237,11 @@ class ViewerWindow(QMainWindow):
                     # else:
                     #     self.process_3d_cube()
     
+                # Measurement errors: look for a variance / error / inverse-
+                # variance cube for this file. Silent — it prints what it found
+                # and falls back to the empirical estimator, never blocks ingest.
+                self.detect_measurement_errors()
+
                 # Extract observation info (skipped on session restore — the
                 # session supplies df_obs and we don't want the NED popup).
                 if for_session:
@@ -2948,6 +3251,48 @@ class ViewerWindow(QMainWindow):
                         self.bkg_image_btn.setEnabled(True)
                 else:
                     self.extract_observation_info()
+
+    def detect_measurement_errors(self):
+        """Find this cube's 1σ measurement errors, silently.
+
+        Looks for a variance / error / inverse-variance extension in the science
+        file, then for a sidecar file next to it (KCWI `*_vcubes.fits`, `*_err`,
+        …). Anything not found or not usable simply leaves the empirical
+        (line-free continuum) estimator in charge — the fit always has a noise
+        model. The user can override the choice from "Measurement Errors…".
+        """
+        set_error_cube(None, {'mode': 'empirical',
+                              'source': HyperCube_Noise.SRC_EMPIRICAL})
+        if FITS_DATA is None or getattr(FITS_DATA, 'ndim', 0) not in (1, 3):
+            return
+        path = getattr(self, 'fits_path', None)
+        try:
+            spec = HyperCube_Noise.detect(path, FITS_DATA.shape,
+                                          getattr(self, 'fits_ext', 0))
+            if spec is None:
+                print('Measurement errors: no variance/error cube found — using '
+                      'the empirical line-free-continuum estimate (DER_SNR).')
+                return
+            self.apply_error_cube_spec(spec, announce=True)
+        except Exception as e:
+            print(f'Measurement errors: {e}\n  → falling back to the empirical estimate.')
+
+    def apply_error_cube_spec(self, spec, announce=False):
+        """Load the σ cube described by `spec` and install it. Raises on failure
+        (the caller decides whether to warn or fall back silently)."""
+        sigma, info = HyperCube_Noise.load_sigma(spec, FITS_DATA.shape)
+        # Keep the errors on the same flux scale as the cube itself.
+        try:
+            fscale = np.float64(self.fluxscalefactor)
+        except (TypeError, ValueError):
+            fscale = 1.0
+        if np.isfinite(fscale) and fscale != 1.0:
+            sigma = sigma * fscale
+        set_error_cube(sigma, info)
+        if announce:
+            print(f"Measurement errors: {info['source']} "
+                  f"({100 * info.get('good_fraction', 0):.1f}% usable pixels)")
+        return info
 
     # ── Session save / restore ────────────────────────────────────────────────
 
@@ -3041,6 +3386,11 @@ class ViewerWindow(QMainWindow):
             # Stellar (pPXF) results + optimal-template cache
             'df_stellar':        _strip_actors(df_stellar),
             'stellar_cache':     STELLAR_CACHE,
+            # Measurement errors: store the *spec*, not the array — the cube is
+            # reloaded from disk on restore. None ⇒ the empirical estimator.
+            'error_spec':        ({k: ERROR_INFO.get(k)
+                                   for k in ('mode', 'path', 'ext', 'kind', 'label')}
+                                  if ERROR_CUBE is not None else None),
         }
         try:
             with open(file_path, 'wb') as f:
@@ -3083,6 +3433,22 @@ class ViewerWindow(QMainWindow):
             QMessageBox.critical(self, 'Load Session', f'Failed to reopen cube:\n{e}')
             return
         self.fits_ext = session.get('fits_ext', getattr(self, 'fits_ext', 0))
+
+        # Restore the measurement-error choice (ingest already ran detection;
+        # an explicit saved choice overrides whatever it found).
+        if 'error_spec' in session:
+            _espec = session.get('error_spec')
+            if _espec is None:
+                set_error_cube(None, {'mode': 'empirical',
+                                      'source': HyperCube_Noise.SRC_EMPIRICAL})
+            else:
+                try:
+                    self.apply_error_cube_spec(_espec, announce=True)
+                except Exception as e:
+                    print(f'Session: measurement errors could not be restored ({e}); '
+                          'using the empirical estimate.')
+                    set_error_cube(None, {'mode': 'empirical',
+                                          'source': HyperCube_Noise.SRC_EMPIRICAL})
 
         # 2) Restore the analysis dataframes / globals.
         df_obs      = session.get('df_obs', df_obs)
@@ -6381,6 +6747,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         ('Signed residual (z)',    'qa_signed_resid_z',  'bwr',    True),
         ('Runs test (z)',          'qa_runs_z',          'bwr',    True),
         ('Reduced χ² (continuum)', 'qa_chisq_cont',      'plasma', False),
+        # Weighted by the measurement errors over the fitted pixels only — the
+        # one χ² that should sit near 1 for a good fit with a correct noise model.
+        ('Reduced χ² (weighted)',  'rchisq_w',           'plasma', False),
         ('Reduced χ² (native)',    'rchisq',             'plasma', False),
     ]
 
@@ -6458,26 +6827,28 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # Insert an empty row to separate the sections
                 writer.writerow([])
                 
-                writer.writerow(['wavelength scale factor', 'flux scale factor'])
-                
-                writer.writerow([self.viewer_window.WLscalefactor,self.viewer_window.fluxscalefactor])
+                writer.writerow(['wavelength scale factor', 'flux scale factor',
+                                 'flux unit', 'wavelength unit', 'velocity unit'])
+
+                writer.writerow([self.viewer_window.WLscalefactor,
+                                 self.viewer_window.fluxscalefactor,
+                                 flux_unit_str(), 'Angstrom', 'km/s'])
     
                 # Insert an empty row to separate the sections
                 writer.writerow([])
                 
                 # Write df_cont (Continuum parameters)
-                writer.writerow(df_cont.columns)  # Header for df_cont
-                writer.writerows(df_cont.values)  # Data for df_cont
+                _cont_out = to_export_units(df_cont)
+                writer.writerow(_cont_out.columns)  # Header for df_cont
+                writer.writerows(_cont_out.values)  # Data for df_cont
     
                 # Insert an empty row to separate the sections
                 writer.writerow([])
     
-                # Write df header (Emission line parameters)
-                writer.writerow(df.columns)  # Header for df
-    
-                # Sort df by 'region_ID' before writing
-                df_sorted = df.sort_values(by='region_ID', ascending=True)
-                writer.writerows(df_sorted.values)  # Data for df
+                # Write df header (Emission line parameters); σ in km/s
+                _df_out = to_export_units(df.sort_values(by='region_ID', ascending=True))
+                writer.writerow(_df_out.columns)  # Header for df
+                writer.writerows(_df_out.values)  # Data for df
     
             print(f"File saved: {file_path}")
 
@@ -6526,6 +6897,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 df_cont_columns = cont_data[0]
                 df_cont_values = cont_data[1:]
                 df_cont = pd.DataFrame(df_cont_values, columns=df_cont_columns)
+                df_cont = from_export_units(df_cont)
     
                 # Convert data types for df_cont
                 df_cont['x1'] = np.float64(df_cont['x1'])
@@ -6540,6 +6912,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 df_columns = line_data[0]
                 df_values = line_data[1:]
                 df = pd.DataFrame(df_values, columns=df_columns)
+                df = from_export_units(df)          # σ km/s → Å, strip unit suffixes
     
                 # Convert numeric columns in df
                 float_columns = [
@@ -6707,12 +7080,29 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         row2 = _new_row()
         row2.addWidget(_cat_label('Cube:'))
 
+        self.smart_constraints_button    = QPushButton('Smart Constraints…')
+        self.meas_errors_button          = QPushButton('Measurement Errors…')
         self.fit_cube_button             = QPushButton('Fit Cube')
         self.fix_fit_button              = QPushButton('Rectify Bad Fits')
         self.rchisq_map_button           = QPushButton('Quality Map ▾')
         self.mask_button                 = QPushButton('Mask…')
         self.clear_all_fits_button       = QPushButton('Clear All Fits')
 
+        self.smart_constraints_button.clicked.connect(self.open_smart_constraints_dialog)
+        if self._edit_mode():
+            self.smart_constraints_button.setEnabled(False)
+            self.smart_constraints_button.setToolTip(
+                'Disabled while editing a single spaxel (schema is locked)')
+        else:
+            self.smart_constraints_button.setToolTip(
+                'Auto-assign kinematic groups, doublet flux ratios, and parameter\n'
+                'bounds for every line in the model, from a chosen physical scenario.')
+        self.meas_errors_button.clicked.connect(self.open_measurement_errors_dialog)
+        self.meas_errors_button.setToolTip(
+            'Choose where per-spaxel 1σ flux uncertainties come from: a variance /\n'
+            'error extension of the cube (or a sidecar file), or an empirical\n'
+            'estimate from the line-free continuum inside each fit window.\n'
+            'These weight the fit and set every reported parameter uncertainty.')
         self.fit_cube_button.clicked.connect(partial(self.fit_cube))
         self.fix_fit_button.clicked.connect(partial(self.fix_fits))
         self.rchisq_map_button.clicked.connect(self.show_quality_menu)
@@ -6730,8 +7120,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'Remove ALL fit results for the whole cube (and per-spaxel edits).\n'
             'The model definition is kept so you can re-fit.')
 
-        for btn in [self.fit_cube_button, self.fix_fit_button, self.rchisq_map_button,
-                    self.mask_button, self.clear_all_fits_button]:
+        for btn in [self.smart_constraints_button, self.meas_errors_button,
+                    self.fit_cube_button, self.fix_fit_button,
+                    self.rchisq_map_button, self.mask_button, self.clear_all_fits_button]:
             btn.setFixedHeight(28)
             row2.addWidget(btn)
 
@@ -6864,6 +7255,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         'qa_signed_resid_z':  3.0,
         'qa_runs_z':          3.0,
         'qa_chisq_cont':      5.0,
+        # Weighted χ²_red is normalised (≈1 for a good fit with a correct noise
+        # model), so it flags much closer to 1 than the unnormalised natives.
+        'rchisq_w':           3.0,
         'rchisq':             5.0,
     }
 
@@ -7617,32 +8011,37 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         primary_hdu = fits.PrimaryHDU()
         extensions.append(primary_hdu)
     
-        # Generate image maps for each line and each fit parameter
+        # Generate image maps for each line and each fit parameter.
+        # Every map is paired with its 1σ uncertainty map, and σ is written as a
+        # velocity dispersion (km/s) — the same unit the GUI and the CSV use.
+        _flux_bunit = flux_unit_str()
+        map_specs = [
+            # (HDU stem, value column, error column, converter, BUNIT)
+            ('amp',   'amp_fit',   'amp_std',   None,             _flux_bunit),
+            ('cen',   'cen_fit',   'cen_std',   None,             'Angstrom'),
+            ('vel',   'vel_fit',   'vel_std',   None,             'km/s'),
+            ('sigma', 'sigma_fit', 'sigma_std', 'kms',            'km/s'),
+        ]
+        ny_map, nx_map = int(FITS_DATA.shape[-2]), int(FITS_DATA.shape[-1])
+
         for line in unique_lines:
             line_df = df_fit[df_fit['LineName'] == line]
-            for param in ["amp_fit", "cen_fit", "vel_fit", "sigma_fit"]:
-                # Create an empty map with NaNs
-                image_map = np.full((int(FITS_DATA.shape[-2]), int(FITS_DATA.shape[-1])), np.nan)
-    
-                # Populate map using RA/Dec indices
-                for (_, row), ra, dec in zip(line_df.iterrows(), ra_vals, dec_vals):
-                    x, y = int(row["spaxel_x"]), int(row["spaxel_y"])
-                    image_map[y, x] = row[param]
-    
-                # Create FITS HDU with WCS header
-                hdu = fits.ImageHDU(data=image_map, name=f"{param[:-4]}_{line}")
-                hdu.header.update(wcs.to_header())  # Add WCS info
-                extensions.append(hdu)
-
-                # Companion velocity-dispersion (km/s) map alongside the Å σ map
-                if param == 'sigma_fit':
-                    kms_map = np.full_like(image_map, np.nan)
-                    for (_, row), ra, dec in zip(line_df.iterrows(), ra_vals, dec_vals):
+            for stem, val_col, err_col, conv, bunit in map_specs:
+                for col, suffix, comment in ((val_col, '', 'best-fit value'),
+                                             (err_col, '_std', '1-sigma uncertainty')):
+                    if col not in line_df.columns:
+                        continue
+                    image_map = np.full((ny_map, nx_map), np.nan)
+                    for _, row in line_df.iterrows():
                         x, y = int(row["spaxel_x"]), int(row["spaxel_y"])
-                        kms_map[y, x] = sigma_wl_to_kms(row['sigma_fit'], row['cen_fit'])
-                    khdu = fits.ImageHDU(data=kms_map, name=f"sigmakms_{line}")
-                    khdu.header.update(wcs.to_header())
-                    extensions.append(khdu)
+                        # σ (and its error) live in Å internally → km/s on output,
+                        # both scaled by the *fitted* centroid of the same spaxel.
+                        image_map[y, x] = (sigma_wl_to_kms(row[col], row['cen_fit'])
+                                           if conv == 'kms' else _safe_float(row[col]))
+                    hdu = fits.ImageHDU(data=image_map, name=f"{stem}{suffix}_{line}")
+                    hdu.header.update(wcs.to_header())  # Add WCS info
+                    hdu.header['BUNIT'] = (bunit, f'{stem} {comment}')
+                    extensions.append(hdu)
 
         # Stellar kinematics maps (one HDU per quantity), if a stellar cube fit
         # has been run.
@@ -7675,6 +8074,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                         shdu.header.update(wcs.to_header())
                     except Exception:
                         pass
+                    # pPXF reports V and σ in km/s; h3/h4/χ² are dimensionless.
+                    shdu.header['BUNIT'] = ('km/s' if scol in ('stellar_V', 'stellar_sigma')
+                                            else '', f'{sname}')
                     extensions.append(shdu)
 
         # Write all extensions to FITS file
@@ -7684,26 +8086,172 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         print(f"FITS file saved to {file_path}")
         
 
-    def _with_sigma_kms_columns(self, frame):
-        """Return a copy of a line/fit DataFrame with companion σ-in-km/s columns.
+    def open_measurement_errors_dialog(self):
+        """Choose where per-pixel 1σ flux uncertainties come from.
 
-        Wavelength-space σ stays the canonical stored value; the *_kms columns
-        are derived (σ_v = c·σ_λ/λ) purely for readability of the CSV and are
-        dropped again on load.
+        Either an error/variance/inverse-variance cube (an extension of the
+        science file or a sidecar file), or the empirical estimate measured from
+        the line-free continuum inside each fit window. Whatever is chosen here
+        weights the fit and is recorded per spaxel in the fit output.
         """
-        out = frame.copy()
-        specs = [('Sigma_0', 'Centroid_0', 'Sigma_0_kms'),
-                 ('Sigma_0_lowlim', 'Centroid_0', 'Sigma_0_lowlim_kms'),
-                 ('Sigma_0_highlim', 'Centroid_0', 'Sigma_0_highlim_kms'),
-                 ('Sigma_fit', 'Centroid_fit', 'Sigma_fit_kms'),
-                 ('sigma_init', 'cen_init', 'sigma_init_kms'),
-                 ('sigma_fit', 'cen_fit', 'sigma_fit_kms'),
-                 ('sigma_std', 'cen_fit', 'sigma_std_kms')]
-        for sig_col, cen_col, kms_col in specs:
-            if sig_col in out.columns and cen_col in out.columns:
-                out[kms_col] = [sigma_wl_to_kms(s, c)
-                                for s, c in zip(out[sig_col], out[cen_col])]
-        return out
+        vw = self.viewer_window
+        if FITS_DATA is None:
+            QMessageBox.information(self, 'Measurement Errors',
+                                    'Open a cube first.')
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Measurement Errors')
+        lay = QVBoxLayout(dlg)
+
+        blurb = QLabel(
+            'Per-pixel 1σ flux uncertainties. The fit is weighted by 1/σ inside '
+            'each fit window,\nso this choice sets every reported parameter '
+            'uncertainty (amp_std, cen_std, vel_std, σ_std).')
+        blurb.setStyleSheet('color: gray;')
+        lay.addWidget(blurb)
+
+        current = QLabel(f"Currently: {ERROR_INFO.get('source', HyperCube_Noise.SRC_EMPIRICAL)}")
+        current.setStyleSheet('font-weight: bold;')
+        lay.addWidget(current)
+
+        group = QButtonGroup(dlg)
+        rb_cube = QRadioButton('Error cube')
+        rb_emp = QRadioButton(
+            'Empirical — robust noise from the line-free continuum inside each '
+            'fit window (DER_SNR)')
+        group.addButton(rb_cube); group.addButton(rb_emp)
+        lay.addWidget(rb_cube)
+
+        # File + extension + flavour, indented under the "Error cube" radio.
+        form = QGridLayout()
+        form.setContentsMargins(24, 0, 0, 8)
+        path_edit = QLineEdit(str(ERROR_INFO.get('path')
+                                  or getattr(vw, 'fits_path', '') or ''))
+        browse = QPushButton('Browse…')
+        ext_combo = QComboBox()
+        kind_combo = QComboBox()
+        for kind in (HyperCube_Noise.KIND_VAR, HyperCube_Noise.KIND_SIGMA,
+                     HyperCube_Noise.KIND_IVAR):
+            kind_combo.addItem(HyperCube_Noise.KIND_LABELS[kind], kind)
+        form.addWidget(QLabel('File:'), 0, 0)
+        form.addWidget(path_edit, 0, 1)
+        form.addWidget(browse, 0, 2)
+        form.addWidget(QLabel('Extension:'), 1, 0)
+        form.addWidget(ext_combo, 1, 1, 1, 2)
+        form.addWidget(QLabel('Values are:'), 2, 0)
+        form.addWidget(kind_combo, 2, 1, 1, 2)
+        lay.addLayout(form)
+        lay.addWidget(rb_emp)
+
+        note = QLabel(
+            'Spaxels already fitted keep the uncertainties they were fitted with; '
+            're-fit to apply a change.')
+        note.setStyleSheet('color: gray; font-size: 11px;')
+        lay.addWidget(note)
+
+        def repopulate():
+            """List the candidate extensions of the file in the path box."""
+            ext_combo.clear()
+            cands = HyperCube_Noise.candidate_extensions(
+                path_edit.text().strip(), FITS_DATA.shape, getattr(vw, 'fits_ext', 0))
+            for c in cands:
+                if c['is_sci']:
+                    continue
+                tag = '' if c['match'] else '  — shape mismatch'
+                kind = f"  [{HyperCube_Noise.KIND_LABELS[c['kind']]}]" if c['kind'] else ''
+                ext_combo.addItem(f"{c['ext']}: {c['name']}  {tuple(c['shape'])}{kind}{tag}",
+                                  (c['ext'], c['kind'], c['match']))
+            if ext_combo.count() == 0:
+                ext_combo.addItem('(no image extensions found)', None)
+            # Prefer the current selection, else the first shape-matching guess.
+            want_ext = ERROR_INFO.get('ext')
+            for i in range(ext_combo.count()):
+                data = ext_combo.itemData(i)
+                if data and want_ext is not None and data[0] == want_ext:
+                    ext_combo.setCurrentIndex(i)
+                    return
+            for i in range(ext_combo.count()):
+                data = ext_combo.itemData(i)
+                if data and data[2] and data[1]:
+                    ext_combo.setCurrentIndex(i)
+                    return
+
+        def sync_kind():
+            data = ext_combo.currentData()
+            if data and data[1]:
+                idx = kind_combo.findData(data[1])
+                if idx >= 0:
+                    kind_combo.setCurrentIndex(idx)
+
+        def pick_file():
+            fn, _ = QFileDialog.getOpenFileName(
+                dlg, 'Select an error / variance cube', os.path.dirname(path_edit.text() or ''),
+                'FITS Files (*.fits *.fits.gz *.fit);;All Files (*)')
+            if fn:
+                path_edit.setText(fn)
+                repopulate()
+                sync_kind()
+
+        browse.clicked.connect(pick_file)
+        ext_combo.currentIndexChanged.connect(sync_kind)
+        path_edit.editingFinished.connect(repopulate)
+
+        def sync_enabled():
+            for w in (path_edit, browse, ext_combo, kind_combo):
+                w.setEnabled(rb_cube.isChecked())
+        rb_cube.toggled.connect(sync_enabled)
+
+        repopulate()
+        if ERROR_CUBE is not None:
+            rb_cube.setChecked(True)
+            idx = kind_combo.findData(ERROR_INFO.get('kind'))
+            if idx >= 0:
+                kind_combo.setCurrentIndex(idx)
+        else:
+            rb_emp.setChecked(True)
+            sync_kind()
+        sync_enabled()
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = QPushButton('Cancel')
+        apply_btn = QPushButton('Apply')
+        apply_btn.setDefault(True)
+        btns.addWidget(cancel_btn); btns.addWidget(apply_btn)
+        lay.addLayout(btns)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        def apply_choice():
+            if rb_emp.isChecked():
+                set_error_cube(None, {'mode': 'empirical',
+                                      'source': HyperCube_Noise.SRC_EMPIRICAL})
+                print('Measurement errors: empirical (line-free continuum, DER_SNR)')
+                dlg.accept()
+                return
+            data = ext_combo.currentData()
+            if not data:
+                QMessageBox.warning(dlg, 'Measurement Errors',
+                                    'No usable extension is selected.')
+                return
+            spec = {'mode': 'ext' if path_edit.text().strip() == str(getattr(vw, 'fits_path', ''))
+                    else 'file',
+                    'path': path_edit.text().strip(), 'ext': int(data[0]),
+                    'kind': kind_combo.currentData(),
+                    'label': os.path.basename(path_edit.text().strip())}
+            try:
+                info = vw.apply_error_cube_spec(spec, announce=True)
+            except Exception as e:
+                QMessageBox.critical(dlg, 'Measurement Errors', str(e))
+                return
+            QMessageBox.information(
+                dlg, 'Measurement Errors',
+                f"Using {info['source']}\n"
+                f"{100 * info.get('good_fraction', 0):.1f}% of pixels have a usable σ.")
+            dlg.accept()
+
+        apply_btn.clicked.connect(apply_choice)
+        dlg.exec_()
 
     def save_cube_fit(self):
         global df, df_cont, df_obs, df_fit, df_stellar
@@ -7723,39 +8271,44 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # Insert an empty row to separate the sections
                 writer.writerow([])
                 
-                writer.writerow(['wavelength scale factor', 'flux scale factor'])
-                
-                writer.writerow([self.viewer_window.WLscalefactor,self.viewer_window.fluxscalefactor])
+                writer.writerow(['wavelength scale factor', 'flux scale factor',
+                                 'flux unit', 'wavelength unit', 'velocity unit'])
+
+                writer.writerow([self.viewer_window.WLscalefactor,
+                                 self.viewer_window.fluxscalefactor,
+                                 flux_unit_str(), 'Angstrom', 'km/s'])
     
                 # Insert an empty row to separate the sections
                 writer.writerow([])
                 
                 # Write df_cont (continuum information)
-                writer.writerow(df_cont.columns)  # Header for df_cont
-                writer.writerows(df_cont.values)  # Data for df_cont
+                _cont_out = to_export_units(df_cont)
+                writer.writerow(_cont_out.columns)  # Header for df_cont
+                writer.writerows(_cont_out.values)  # Data for df_cont
     
                 # Insert an empty row for separation
                 writer.writerow([])
     
-                # Write df (line information) with companion σ km/s columns
-                _df_out = self._with_sigma_kms_columns(df)
+                # Write df (line information); σ in km/s, units in the names
+                _df_out = to_export_units(df)
                 writer.writerow(_df_out.columns)  # Header for df
                 writer.writerows(_df_out.values)  # Data for df
 
                 # Insert an empty row for separation
                 writer.writerow([])
 
-                # Write df_fit (Fitting results) with companion σ km/s columns
-                _fit_out = self._with_sigma_kms_columns(df_fit)
+                # Write df_fit (Fitting results); σ in km/s, units in the names
+                _fit_out = to_export_units(df_fit)
                 writer.writerow(_fit_out.columns)  # Header for df_fit
                 writer.writerows(_fit_out.values)  # Data for df_fit
 
                 # Write df_stellar (per-spaxel stellar kinematics), if any. This
                 # extra section is optional; older loaders simply ignore it.
                 if isinstance(df_stellar, pd.DataFrame) and len(df_stellar) > 0:
+                    _stel_out = to_export_units(df_stellar)
                     writer.writerow([])
-                    writer.writerow(df_stellar.columns)
-                    writer.writerows(df_stellar.values)
+                    writer.writerow(_stel_out.columns)
+                    writer.writerows(_stel_out.values)
 
             print(f"CSV File saved: {file_path}")
             
@@ -7811,6 +8364,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             df_cont = pd.DataFrame(rows[df_cont_data_start:df_cont_data_end],
                                   columns=rows[df_cont_header_index])
             df_cont = df_cont.apply(pd.to_numeric, errors='ignore')
+            df_cont = from_export_units(df_cont)
 
             # Normalise the spline columns. Older CSVs predate them → default to
             # linear with empty knots; for spline rows parse the "[...]" strings
@@ -7839,8 +8393,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             df = pd.DataFrame(rows[df_data_start:df_data_end],
                              columns=rows[df_header_index])
             df = df.apply(pd.to_numeric, errors='ignore')
-            # Drop companion σ km/s columns: Å is canonical, *_kms are derived.
-            df = df[[c for c in df.columns if not str(c).endswith('_kms')]]
+            # Back to internal units/names (σ → Å); accepts older CSVs too.
+            df = from_export_units(df)
             
             # Read df_fit (fourth section, after third empty row)
             df_fit_header_index = split_indices[3] + 1
@@ -7855,8 +8409,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             df_fit = pd.DataFrame(rows[df_fit_data_start:df_fit_data_end],
                                  columns=rows[df_fit_header_index])
             df_fit = df_fit.apply(pd.to_numeric, errors='ignore')
-            # Drop companion σ km/s columns: Å is canonical, *_kms are derived.
-            df_fit = df_fit[[c for c in df_fit.columns if not str(c).endswith('_kms')]]
+            # Back to internal units/names (σ → Å); accepts older CSVs too.
+            df_fit = from_export_units(df_fit)
 
             # Optional df_stellar section (per-spaxel stellar kinematics → maps).
             df_stellar = pd.DataFrame({})
@@ -7867,6 +8421,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 if _sh < len(rows):
                     df_stellar = pd.DataFrame(rows[_sh + 1:], columns=rows[_sh])
                     df_stellar = df_stellar.apply(pd.to_numeric, errors='ignore')
+                    df_stellar = from_export_units(df_stellar)
             
             if 'RA' not in df_fit.columns:
                 df_fit['RA'] = self.viewer_window.pixel_to_ra_dec(df_fit['spaxel_x'],df_fit['spaxel_y'])[0]
@@ -8119,6 +8674,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         global fit_results (used by single-spaxel fits and Rectify)."""
         global fit_results
         vw = self.viewer_window
+        # A 1D spectrum has no spaxel grid; treat it as the single spaxel (0, 0).
+        if vw.current_spaxel is None and vw.is_1d_spectrum:
+            vw.current_spaxel = (0, 0)
         cx, cy = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
         if vw.is_1d_spectrum is False:
             spectrum = vw.get_spectrum_at_spaxel(cx, cy)
@@ -8147,7 +8705,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             spectrum, stellar_baseline, wavelengths, params_to_use,
             piecewise_model, df, df_cont, z, max_nfev,
             getattr(self, '_sequential_fit', False), (cx, cy), _ra, _dec,
-            stellar_kin)
+            stellar_kin, sigma_at_spaxel(cx, cy), noise_source_label())
         fit_results.extend(rows)
 
 
@@ -8523,6 +9081,252 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
     # ── Stellar (pPXF) continuum ─────────────────────────────────────────────
 
+    def open_smart_constraints_dialog(self):
+        """Open Smart Constraints: auto-assign K-groups, doublet flux ratios,
+        and parameter bounds for every line in the model, from a chosen
+        physical scenario. See HyperCube_SmartConstraints.build_plan."""
+        try:
+            self._open_smart_constraints_impl()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(None, 'Smart Constraints', f'{type(e).__name__}: {e}')
+
+    def _open_smart_constraints_impl(self):
+        global df
+        if len(df) == 0:
+            QMessageBox.information(self, 'Smart Constraints',
+                                     'No lines in the model yet — add lines first.')
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Smart Constraints')
+        dlg.setMinimumWidth(500)
+        v = QVBoxLayout(dlg)
+
+        # ── Scenario ─────────────────────────────────────────────────────
+        v.addWidget(QLabel('<b>Physical scenario:</b>'))
+        scenario_group = QtWidgets.QButtonGroup(dlg)
+        scenario_buttons = {}
+        SCENARIO_LABELS = [
+            ('quiescent', 'Quiescent / Star-forming — single kinematic component'),
+            ('outflow', 'AGN Outflow — core + blueshifted broad component(s)'),
+            ('shock', 'Shock / LINER — broad, wide velocity range'),
+            ('custom', 'Custom — set toggles manually, no preset'),
+        ]
+        for key, label in SCENARIO_LABELS:
+            rb = QtWidgets.QRadioButton(label, dlg)
+            scenario_group.addButton(rb)
+            scenario_buttons[key] = rb
+            v.addWidget(rb)
+        scenario_buttons['quiescent'].setChecked(True)
+
+        # ── Toggles ──────────────────────────────────────────────────────
+        v.addWidget(QLabel('<b>Options:</b>'))
+        kgroup_cb = QCheckBox('Assign K-groups (core → K1, secondary → K2/K3)', dlg)
+        v.addWidget(kgroup_cb)
+
+        ion_row = QHBoxLayout()
+        ion_cb = QCheckBox('Split secondary K-group by ionization potential, threshold (eV):', dlg)
+        ion_edit = QLineEdit(str(hcsc.DEFAULT_IP_THRESHOLD_EV), dlg)
+        ion_edit.setFixedWidth(60)
+        ion_row.addWidget(ion_cb); ion_row.addWidget(ion_edit); ion_row.addStretch()
+        v.addLayout(ion_row)
+
+        rel_cb = QCheckBox('Add relational sigma/amp bounds for secondary components '
+                            '(broader + fainter than core)', dlg)
+        v.addWidget(rel_cb)
+
+        bounds_cb = QCheckBox('Set absolute sigma / centroid bounds per scenario', dlg)
+        v.addWidget(bounds_cb)
+
+        dens_row = QHBoxLayout()
+        dens_row.addWidget(QLabel('Density-sensitive doublets ([S II], [O II]):'))
+        dens_group = QtWidgets.QButtonGroup(dlg)
+        dens_fix = QtWidgets.QRadioButton('Fix to low-density limit', dlg)
+        dens_float = QtWidgets.QRadioButton('Float (bounded)', dlg)
+        dens_group.addButton(dens_fix); dens_group.addButton(dens_float)
+        dens_row.addWidget(dens_fix); dens_row.addWidget(dens_float); dens_row.addStretch()
+        v.addLayout(dens_row)
+
+        balmer_row = QHBoxLayout()
+        balmer_row.addWidget(QLabel('Balmer decrement (Hα/Hβ):'))
+        balmer_group = QtWidgets.QButtonGroup(dlg)
+        balmer_float = QtWidgets.QRadioButton('Float (measure reddening)', dlg)
+        balmer_fix = QtWidgets.QRadioButton('Fix to case B (2.86)', dlg)
+        balmer_group.addButton(balmer_float); balmer_group.addButton(balmer_fix)
+        balmer_row.addWidget(balmer_float); balmer_row.addWidget(balmer_fix); balmer_row.addStretch()
+        v.addLayout(balmer_row)
+
+        note = QLabel(
+            '[N II] 6548/6584 and [O III] 4959/5007 doublet ratios are always fixed '
+            'automatically when both lines are present (set by atomic transition '
+            'probabilities, not gas conditions) — not affected by these toggles.', dlg)
+        note.setWordWrap(True)
+        note.setStyleSheet('color: gray; font-size: 11px;')
+        v.addWidget(note)
+
+        def _apply_scenario_defaults():
+            key = next(k for k, rb in scenario_buttons.items() if rb.isChecked())
+            if key == 'quiescent':
+                kgroup_cb.setChecked(True); ion_cb.setChecked(False)
+                rel_cb.setChecked(True); bounds_cb.setChecked(True)
+                dens_fix.setChecked(True); balmer_float.setChecked(True)
+            elif key in ('outflow', 'shock'):
+                kgroup_cb.setChecked(True); ion_cb.setChecked(True)
+                rel_cb.setChecked(True); bounds_cb.setChecked(True)
+                dens_float.setChecked(True); balmer_float.setChecked(True)
+            else:  # custom
+                kgroup_cb.setChecked(False); ion_cb.setChecked(False)
+                rel_cb.setChecked(False); bounds_cb.setChecked(False)
+                dens_fix.setChecked(True); balmer_float.setChecked(True)
+
+        dens_fix.setChecked(True)
+        balmer_float.setChecked(True)
+        for rb in scenario_buttons.values():
+            rb.toggled.connect(lambda checked: _apply_scenario_defaults() if checked else None)
+        _apply_scenario_defaults()
+
+        # ── Preview / Apply ──────────────────────────────────────────────
+        v.addWidget(QLabel('<b>Preview:</b>'))
+        preview_box = QTextEdit(dlg)
+        preview_box.setReadOnly(True)
+        preview_box.setMinimumHeight(160)
+        v.addWidget(preview_box)
+
+        state = {'plan': None}
+
+        def _current_settings():
+            try:
+                ip_threshold = float(ion_edit.text())
+            except ValueError:
+                ip_threshold = hcsc.DEFAULT_IP_THRESHOLD_EV
+            scenario = next(k for k, rb in scenario_buttons.items() if rb.isChecked())
+            return dict(
+                scenario=scenario,
+                split_ionization=ion_cb.isChecked(),
+                density_mode='float' if dens_float.isChecked() else 'fix',
+                balmer_mode='fix' if balmer_fix.isChecked() else 'float',
+                assign_kgroups=kgroup_cb.isChecked(),
+                add_relational_bounds=rel_cb.isChecked(),
+                set_absolute_bounds=bounds_cb.isChecked(),
+                ip_threshold=ip_threshold)
+
+        def _preview():
+            settings = _current_settings()
+            line_lib = _load_line_library() if settings['split_ionization'] else None
+            plan = hcsc.build_plan(
+                df, settings['scenario'],
+                split_ionization=settings['split_ionization'],
+                density_mode=settings['density_mode'],
+                balmer_mode=settings['balmer_mode'],
+                assign_kgroups=settings['assign_kgroups'],
+                add_relational_bounds=settings['add_relational_bounds'],
+                set_absolute_bounds=settings['set_absolute_bounds'],
+                ip_threshold=settings['ip_threshold'],
+                line_library=line_lib)
+            state['plan'] = plan
+            preview_box.setPlainText('\n'.join(plan.summary_lines))
+            apply_btn.setEnabled(True)
+
+        def _invalidate_preview():
+            state['plan'] = None
+            apply_btn.setEnabled(False)
+            preview_box.setPlainText('(settings changed — click Preview to refresh)')
+
+        for w in (kgroup_cb, ion_cb, rel_cb, bounds_cb, dens_fix, dens_float,
+                  balmer_float, balmer_fix):
+            w.toggled.connect(_invalidate_preview)
+        for rb in scenario_buttons.values():
+            rb.toggled.connect(lambda checked: _invalidate_preview() if checked else None)
+        ion_edit.textChanged.connect(_invalidate_preview)
+
+        brow = QHBoxLayout()
+        help_btn = QPushButton('?', dlg)
+        help_btn.setFixedSize(22, 22)
+        help_btn.setToolTip('What Smart Constraints does')
+        help_btn.clicked.connect(lambda: self._show_smart_constraints_help(dlg))
+        preview_btn = QPushButton('Preview', dlg)
+        preview_btn.clicked.connect(_preview)
+        apply_btn = QPushButton('Apply', dlg)
+        apply_btn.setEnabled(False)
+        cancel_btn = QPushButton('Cancel', dlg)
+        cancel_btn.clicked.connect(dlg.reject)
+        brow.addWidget(help_btn); brow.addStretch()
+        brow.addWidget(preview_btn); brow.addWidget(apply_btn); brow.addWidget(cancel_btn)
+        v.addLayout(brow)
+
+        def _apply():
+            if state['plan'] is None:
+                return
+            self._apply_smart_constraint_plan(state['plan'])
+            dlg.accept()
+        apply_btn.clicked.connect(_apply)
+
+        _invalidate_preview()
+        dlg.exec_()
+
+    def _apply_smart_constraint_plan(self, plan):
+        """Write a HyperCube_SmartConstraints.SmartConstraintPlan into the
+        global df (bounds, doublet/relational constraints, then K-groups
+        last so kinematic ties take precedence in the 5-constraint-slot
+        list), then refresh the Fit Parameters panel."""
+        global df
+        for lid, updates in plan.bound_updates.items():
+            for col, value in updates.items():
+                df.loc[df['Line_ID'] == lid, col] = value
+        for line_name, additions in plan.constraint_additions.items():
+            self._rewrite_smart_constraints(line_name, add=additions)
+        if plan.kgroup_assignments:
+            for lid, group in plan.kgroup_assignments.items():
+                df.loc[df['Line_ID'] == lid, 'kgroup'] = group
+            self._sync_kgroup_constraints()
+
+        x, y = None, None
+        vw = self.viewer_window
+        if vw is not None and getattr(vw, 'current_spaxel', None) is not None:
+            x, y = int(vw.current_spaxel[0]), int(vw.current_spaxel[1])
+        self.rebuild_fit_panel(show_fit=False, x=x, y=y)
+
+    def _show_smart_constraints_help(self, parent):
+        text = (
+            "<b>Smart Constraints</b><br><br>"
+            "Auto-fills the same K-group / constraint / bound fields you'd "
+            "otherwise set line-by-line in the Edit Line dialog, for every "
+            "line in the model at once:<br><br>"
+            "&nbsp;&nbsp;• <b>K-groups</b> — core (narrowest of each "
+            "rest-wavelength group) → K1; broader partners → K2 (or K2/K3 "
+            "split by ionization potential).<br>"
+            "&nbsp;&nbsp;• <b>Atomic-fixed doublets</b> — [N II] 6548/6584 "
+            "and [O III] 4959/5007 flux ratios, always fixed when both "
+            "lines are present.<br>"
+            "&nbsp;&nbsp;• <b>Density-sensitive doublets</b> — [S II] "
+            "6716/6731, [O II] 3726/3729: fixed to the low-density limit, "
+            "or floated within the physical range.<br>"
+            "&nbsp;&nbsp;• <b>Balmer decrement</b> — Hα/Hβ, floated to "
+            "measure reddening, or fixed to case B (2.86).<br>"
+            "&nbsp;&nbsp;• <b>Relational bounds</b> — secondary components "
+            "get sigma ≥ core's and amp ≤ core's (broader + fainter).<br>"
+            "&nbsp;&nbsp;• <b>Absolute bounds</b> — per-scenario sigma / "
+            "centroid windows (km/s).<br><br>"
+            "Re-running Smart Constraints replaces its own previous output "
+            "(picking a new scenario, toggling options) without touching "
+            "constraints you typed by hand in the Edit Line dialog."
+        )
+        d = QDialog(parent)
+        d.setWindowTitle('Smart Constraints — Help')
+        d.setMinimumWidth(380)
+        lay = QVBoxLayout(d)
+        lbl = QLabel(text, d)
+        lbl.setWordWrap(True)
+        lbl.setTextFormat(Qt.RichText)
+        lay.addWidget(lbl)
+        ok = QPushButton('OK', d)
+        ok.setDefault(True)
+        ok.clicked.connect(d.accept)
+        lay.addWidget(ok, alignment=Qt.AlignRight)
+        d.exec_()
+
     def open_stellar_templates(self):
         """Open the Stellar Templates window for the current spaxel; on Accept,
         run pPXF and create/replace a stellar continuum region."""
@@ -8834,9 +9638,22 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         cube = np.ascontiguousarray(FITS_DATA)
         shm = shared_memory.SharedMemory(create=True, size=int(cube.nbytes))
+        err_shm = None
         try:
             shm_arr = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
             shm_arr[:] = cube[:]
+
+            # Measurement errors, shared read-only the same way (float32 keeps
+            # the extra footprint to half the cube's).
+            err_ctx = {}
+            if ERROR_CUBE is not None and ERROR_CUBE.shape == cube.shape:
+                err = np.ascontiguousarray(ERROR_CUBE, dtype=np.float32)
+                err_shm = shared_memory.SharedMemory(create=True, size=int(err.nbytes))
+                err_arr = np.ndarray(err.shape, dtype=err.dtype, buffer=err_shm.buf)
+                err_arr[:] = err[:]
+                err_ctx = dict(err_shm_name=err_shm.name, err_shape=tuple(err.shape),
+                               err_dtype=str(err.dtype),
+                               sigma_label=noise_source_label())
 
             # Lightweight stellar region specs (workers load/prepare the libs).
             stellar_specs, stellar_mask = [], ()
@@ -8863,7 +9680,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 params_dumps=params.dumps(), n_regions=int(n_regions),
                 n_lines=int(n_lines), df=df_w, df_cont=df_cont_w, z=z, R=R,
                 sequential=bool(getattr(self, '_sequential_fit', False)),
-                max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask)
+                max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask,
+                **err_ctx)
 
             # Precompute RA/Dec for all gated spaxels (keeps WCS out of workers).
             xs = np.array([ij[0] for ij in gated])
@@ -8920,11 +9738,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                         os.environ[k] = v
             return _stellar_rows
         finally:
-            shm.close()
-            try:
-                shm.unlink()
-            except FileNotFoundError:
-                pass
+            for _shm in (shm, err_shm):
+                if _shm is None:
+                    continue
+                _shm.close()
+                try:
+                    _shm.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _stellar_cube_prep(self):
         """Prepare a per-spaxel stellar fit across the cube. Returns a LIST of
@@ -9095,6 +9916,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     def _fit_single_spaxel_impl(self):
         global df, df_cont, df_fit, df_obs, fit_results, piecewise_model, line, viewing_fit
         global base_df_cont, base_df, spaxel_overrides
+
+        # A 1D spectrum has no spaxel grid; treat it as the single spaxel (0, 0)
+        # so the single-spaxel fit path works without a prior image click.
+        vw = self.viewer_window
+        if vw.current_spaxel is None and vw.is_1d_spectrum:
+            vw.current_spaxel = (0, 0)
 
         # Capture the base template lazily so lock-to-load works afterwards.
         if base_df_cont is None:
@@ -10715,7 +11542,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         text = (
             "<b>Constraint Syntax Reference</b><br><br>"
             "<b>Parameters:</b><br>"
-            "&nbsp;&nbsp;<tt>amp</tt> — amplitude<br>"
+            "&nbsp;&nbsp;<tt>amp</tt> — amplitude (peak height)<br>"
+            "&nbsp;&nbsp;<tt>flux</tt> — integrated line flux (amp·&sigma;·&radic;2&pi;)<br>"
             "&nbsp;&nbsp;<tt>sigma</tt> — line width (&sigma;)<br>"
             "&nbsp;&nbsp;<tt>cen</tt> — centroid (wavelength)<br>"
             "&nbsp;&nbsp;<tt>vel</tt> — velocity (converted to centroid internally)<br><br>"
@@ -10728,7 +11556,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             "&nbsp;&nbsp;<tt>amp &lt;= amp_[Halpha]</tt><br>"
             "&nbsp;&nbsp;<tt>sigma &gt;= sigma_[Halpha_b]</tt><br>"
             "&nbsp;&nbsp;<tt>vel == vel_[nii_1]</tt><br>"
-            "&nbsp;&nbsp;<tt>amp &lt;= 0.33 * amp_[Halpha]</tt><br><br>"
+            "&nbsp;&nbsp;<tt>amp &lt;= 0.33 * amp_[Halpha]</tt><br>"
+            "&nbsp;&nbsp;<tt>flux == 2.94 * flux_[[N II]_6548]</tt> — fixed flux ratio<br>"
+            "&nbsp;&nbsp;<tt>flux == 0.44..1.45 * flux_[[S II]_6731]</tt> — flux ratio within a range<br><br>"
             "<b>Velocity ties & windows</b> (Δv in km/s, relative to the "
             "reference line):<br>"
             "&nbsp;&nbsp;<tt>vel == vel_[nii_1]</tt> — same velocity (Δv = 0)<br>"
@@ -10883,6 +11713,42 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     # velocity window/one-sided form ('vel == vel_[B] +- 300', 'vel <= ...').
     _KG_VEL_RE = re.compile(r'^\s*vel\s*==\s*vel_\[.*\]\s*$')
 
+    # Signatures identifying constraints authored by Smart Constraints, so
+    # re-running it (e.g. switching scenario) replaces its own prior output
+    # instead of stacking duplicates, while leaving a user's own manually
+    # typed constraints untouched. A manual constraint that happens to match
+    # one of these forms is treated as smart-managed too — same accepted
+    # trade-off as the K-group tie signatures above.
+    _SMART_FLUX_RE = re.compile(r'^\s*flux\s*==\s*[\d.]+(?:\.\.[\d.]+)?\s*\*\s*flux_\[')
+    _SMART_SIGMA_REL_RE = re.compile(r'^\s*sigma\s*>=\s*sigma_\[')
+    _SMART_AMP_REL_RE = re.compile(r'^\s*amp\s*<=\s*amp_\[')
+
+    def _rewrite_smart_constraints(self, line_name, add=None):
+        """Rewrite a line's constraints, replacing only Smart-Constraints-
+        managed entries (flux ratio / relational sigma / relational amp).
+        Mirrors `_rewrite_kgroup_ties`.
+
+        Uses positional indexing (df can carry duplicate index labels, built
+        via pd.concat without ignore_index — see save_gaussian's comment —
+        so `.at[label, ...]` degrades to `.loc` and raises a length-mismatch
+        the moment two lines share a label)."""
+        global df
+        if 'constraints' not in df.columns:
+            df['constraints'] = [['', '', '', '', ''] for _ in range(len(df))]
+        col = df.columns.get_loc('constraints')
+        for pos in np.where((df['Line_Name'] == line_name).to_numpy())[0]:
+            clist = self._normalize_constraint_list(df.iloc[pos, col])
+            kept = [c for c in clist if c.strip()
+                    and not self._SMART_FLUX_RE.match(c)
+                    and not self._SMART_SIGMA_REL_RE.match(c)
+                    and not self._SMART_AMP_REL_RE.match(c)]
+            if add:
+                kept = kept + list(add)
+            kept = kept[-5:]
+            while len(kept) < 5:
+                kept.append('')
+            df.iat[pos, col] = kept
+
     def _rest_wl(self, line_name):
         """Rest wavelength (Å) for a line, or None if missing/invalid."""
         try:
@@ -10899,12 +11765,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         sigma constraint in add_dataframe_constraints_to_params (non-destructive:
         the manual constraint stays in the list and re-activates once the ties
         are removed).
+
+        Uses positional indexing (df can carry duplicate index labels, built
+        via pd.concat without ignore_index — see save_gaussian's comment —
+        so `.at[label, ...]` degrades to `.loc` and raises a length-mismatch
+        the moment two lines share a label).
         """
         global df
         if 'constraints' not in df.columns:
             df['constraints'] = [['', '', '', '', ''] for _ in range(len(df))]
-        for idx in df.index[df['Line_Name'] == line_name]:
-            clist = self._normalize_constraint_list(df.at[idx, 'constraints'])
+        col = df.columns.get_loc('constraints')
+        for pos in np.where((df['Line_Name'] == line_name).to_numpy())[0]:
+            clist = self._normalize_constraint_list(df.iloc[pos, col])
             kept = [c for c in clist if c.strip()
                     and not self._KG_VEL_RE.match(c)
                     and not self._KG_SIGMA_RE.search(c)]
@@ -10913,7 +11785,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             kept = kept[-5:]                  # keep ties + most-recent manual (5 slots)
             while len(kept) < 5:
                 kept.append('')
-            df.at[idx, 'constraints'] = kept
+            df.iat[pos, col] = kept
 
     def _set_kgroup_ties(self, line_name, reference):
         """Tie this line's velocity AND velocity dispersion to the reference.

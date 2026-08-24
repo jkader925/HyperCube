@@ -21,6 +21,7 @@ import pandas as pd
 from lmfit import Model, Parameters
 
 import HyperCube_ModelFunctions
+import HyperCube_Noise
 
 try:
     import HyperCube_pPXF as hcppxf
@@ -82,15 +83,19 @@ def component_pairs(df):
     return pairs
 
 
-def staged_fit(model, y, params, wavelengths, max_nfev, df):
+def staged_fit(model, y, params, wavelengths, max_nfev, df,
+               weights=None, scale_covar=True):
     """Sequential core→outflow fit (breaks the narrow/broad degeneracy). Falls
-    back to a single joint fit if there are no narrow/broad pairs or on error."""
+    back to a single joint fit if there are no narrow/broad pairs or on error.
+    `weights` / `scale_covar` are passed to every stage so the reported
+    uncertainties come from the same likelihood as the final joint polish."""
     try:
         pairs = component_pairs(df)
     except Exception:
         pairs = []
     if not pairs:
-        return model.fit(y, params, x=wavelengths, max_nfev=max_nfev)
+        return model.fit(y, params, x=wavelengths, max_nfev=max_nfev,
+                         weights=weights, scale_covar=scale_covar)
 
     try:
         broad_amps = {f'amp{i_b}' for (_i_n, i_b) in pairs}
@@ -102,7 +107,8 @@ def staged_fit(model, y, params, wavelengths, max_nfev, df):
         for k in broad_amps:
             if k in p1 and not p1[k].expr:
                 p1[k].set(value=0.0, vary=False)
-        r1 = model.fit(y, p1, x=wavelengths, max_nfev=max_nfev)
+        r1 = model.fit(y, p1, x=wavelengths, max_nfev=max_nfev,
+                       weights=weights, scale_covar=scale_covar)
 
         # Stage 2 — broad on the residual: freeze core + continuum, free broad.
         p2 = r1.params.copy()
@@ -120,17 +126,20 @@ def staged_fit(model, y, params, wavelengths, max_nfev, df):
                   name.startswith(cont_prefixes)):
                 if p.expr is None:
                     p.vary = False
-        r2 = model.fit(y, p2, x=wavelengths, max_nfev=max_nfev)
+        r2 = model.fit(y, p2, x=wavelengths, max_nfev=max_nfev,
+                       weights=weights, scale_covar=scale_covar)
 
         # Stage 3 — joint polish from the staged solution.
         p3 = r2.params.copy()
         for name, p in p3.items():
             if p.expr is None and name in orig_vary:
                 p.vary = orig_vary[name]
-        return model.fit(y, p3, x=wavelengths, max_nfev=max(64, max_nfev // 2))
+        return model.fit(y, p3, x=wavelengths, max_nfev=max(64, max_nfev // 2),
+                         weights=weights, scale_covar=scale_covar)
     except Exception as e:
         print(f"Staged fit fell back to joint fit: {type(e).__name__}: {e}")
-        return model.fit(y, params, x=wavelengths, max_nfev=max_nfev)
+        return model.fit(y, params, x=wavelengths, max_nfev=max_nfev,
+                         weights=weights, scale_covar=scale_covar)
 
 
 # ── calibrated goodness-of-fit metrics ───────────────────────────────────────
@@ -218,10 +227,87 @@ def fit_quality_metrics(spectrum, wavelengths, result, flux_scale, df, df_cont):
     return out
 
 
+# ── measurement errors (weights) ─────────────────────────────────────────────
+def fit_windows(params, n_regions):
+    """[(x_start, x_end), …] for the continuum regions actually being fitted."""
+    wins = []
+    for r in range(1, int(n_regions) + 1):
+        ks, ke = f'x{r}_start', f'x{r}_end'
+        if ks in params and ke in params:
+            x0, x1 = float(params[ks].value), float(params[ke].value)
+            if np.isfinite(x0) and np.isfinite(x1):
+                wins.append((min(x0, x1), max(x0, x1)))
+    return wins
+
+
+def spaxel_noise(spectrum, wavelengths, params, df, df_cont, sigma_in=None,
+                 sigma_label=None, min_pix=10):
+    """Per-pixel 1σ and fit weights for ONE spaxel.
+
+    `sigma_in` is this spaxel's column of a variance/error cube (already
+    converted to 1σ) or None to measure the noise empirically from the line-free
+    continuum inside the fit windows.
+
+    Returns (weights, source, median_sigma):
+      weights      1/σ inside the fit windows, 0 elsewhere and on bad pixels.
+                   The model is identically zero outside the windows
+                   (PiecewiseModel), so those pixels carry no information and
+                   must not enter χ² — zero-weighting them is what makes the
+                   reported uncertainties (and χ²_red) meaningful.
+      source       short provenance token for the `noise_source` output column.
+      median_sigma median σ over the pixels that were actually used.
+    """
+    lam = np.asarray(wavelengths, dtype=float)
+    wins = fit_windows(params, len(df_cont))
+    in_win = np.zeros(lam.shape, dtype=bool)
+    for lo, hi in wins:
+        in_win |= (lam >= lo) & (lam <= hi)
+
+    source = HyperCube_Noise.SRC_NONE
+    sigma = None
+    if sigma_in is not None:
+        cand = np.asarray(sigma_in, dtype=float)
+        if cand.shape == lam.shape and np.isfinite(cand[in_win]).sum() >= min_pix:
+            sigma = cand
+            source = sigma_label or 'error-cube'
+
+    if sigma is None:
+        # Empirical: exclude ±3σ around every line before measuring the noise.
+        cens, halfs = [], []
+        for i in range(1, len(df) + 1):
+            ck, sk = f'cen{i}', f'sigma{i}'
+            if ck in params and sk in params:
+                cen = float(params[ck].value)
+                sig = abs(float(params[sk].value))
+                p_sig = params[sk]
+                if p_sig.max is not None and np.isfinite(float(p_sig.max)):
+                    sig = max(sig, abs(float(p_sig.max)))
+                if np.isfinite(cen) and np.isfinite(sig) and sig > 0:
+                    cens.append(cen)
+                    halfs.append(3.0 * sig)
+        sigma, ok = HyperCube_Noise.empirical_sigma(
+            spectrum, lam, wins, cens, halfs)
+        source = HyperCube_Noise.SRC_EMPIRICAL if ok else HyperCube_Noise.SRC_NONE
+        if not ok:
+            sigma = None
+
+    if sigma is None:
+        return None, HyperCube_Noise.SRC_NONE, np.nan
+
+    good = in_win & np.isfinite(sigma) & (np.asarray(sigma, float) > 0) \
+        & np.isfinite(np.asarray(spectrum, dtype=float))
+    if good.sum() < min_pix:
+        return None, HyperCube_Noise.SRC_NONE, np.nan
+
+    weights = np.zeros(lam.shape, dtype=float)
+    weights[good] = 1.0 / np.asarray(sigma, dtype=float)[good]
+    return weights, source, float(np.median(np.asarray(sigma, float)[good]))
+
+
 # ── the per-spaxel full-model fit ────────────────────────────────────────────
 def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model,
                    df, df_cont, z, max_nfev, sequential, spaxel_xy, ra, dec,
-                   stellar_kin):
+                   stellar_kin, sigma_in=None, sigma_label=None):
     """Fit the full spectral model (continuum of any type per region + a Gaussian
     per line) to ONE spaxel and return a list of per-line result-row dicts (or a
     single error row). Mirrors the body of HyperCube.fit_spaxel exactly, but with
@@ -231,6 +317,16 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
     stellar_baseline  : array subtracted from spectrum (zeros if no stellar region).
     stellar_kin       : {region_id: {'V','sigma','h3','h4','scale'}} for stellar regions.
     spaxel_xy         : (x, y); ra/dec : sky coords for the result rows.
+    sigma_in          : this spaxel's 1σ measurement errors (from a variance /
+                        error cube), or None to measure the noise empirically
+                        from the line-free continuum inside the fit windows.
+    sigma_label       : provenance token for `sigma_in` (written to the output).
+
+    The fit is weighted by 1/σ inside the fit windows and zero-weighted outside
+    them, so the reported `*_std` are propagated measurement errors rather than
+    residual-scatter estimates. If no noise model can be built at all the fit
+    falls back to the unweighted, covariance-rescaled behaviour and says so via
+    the `noise_source` column.
     """
     cx, cy = int(spaxel_xy[0]), int(spaxel_xy[1])
     rows = []
@@ -272,15 +368,40 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
 
     c = C_KMS
 
+    # Measurement errors → fit weights. Weights are in the SCALED flux units the
+    # fit works in (σ_scaled = σ/flux_scale ⇒ w_scaled = flux_scale·w).
+    try:
+        weights, noise_source, noise_median = spaxel_noise(
+            spectrum, wavelengths, params_to_use, df, df_cont, sigma_in, sigma_label)
+    except Exception as e:
+        print(f"Noise estimate failed for spaxel ({cx},{cy}): {type(e).__name__}: {e}")
+        weights, noise_source, noise_median = None, HyperCube_Noise.SRC_NONE, np.nan
+    n_used = int(np.count_nonzero(weights)) if weights is not None else 0
+    weights_scaled = None if weights is None else weights * flux_scale
+    # With a real noise model the covariance is already in physical units, so it
+    # must NOT be rescaled by χ²_red; without one, keep lmfit's default rescaling
+    # (that is the historical behaviour).
+    scale_covar = weights_scaled is None
+
     try:
         if sequential:
             result = staged_fit(model, spectrum_scaled, params_scaled,
-                                wavelengths, max_nfev, df)
+                                wavelengths, max_nfev, df,
+                                weights=weights_scaled, scale_covar=scale_covar)
         else:
             result = model.fit(spectrum_scaled, params_scaled, x=wavelengths,
-                               max_nfev=max_nfev)
+                               max_nfev=max_nfev, weights=weights_scaled,
+                               scale_covar=scale_covar)
 
         qa = fit_quality_metrics(spectrum, wavelengths, result, flux_scale, df, df_cont)
+        # Reduced χ² over the pixels that were actually weighted. lmfit's own
+        # redchi divides by the FULL spectrum length (the model is zero outside
+        # the fit windows), so it is not a usable goodness-of-fit on its own.
+        rchisq_w = np.nan
+        if weights_scaled is not None:
+            _dof = n_used - int(result.nvarys)
+            if _dof > 0 and np.isfinite(result.chisqr):
+                rchisq_w = float(result.chisqr) / _dof
 
         cont_map = {f"x{i + 1}_start": i + 1 for i in range(len(df_cont))}
 
@@ -344,10 +465,15 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
             sigma_key = f'sigma{line_idx}'
 
             if np.isfinite(rest_wavelength):
-                vel_init = c * ((params_to_use[cen_key].init_value / (rest_wavelength * (z + 1))) - 1)
-                vel_fit = c * ((result.params[cen_key].value / (rest_wavelength * (z + 1))) - 1)
+                lam_obs0 = rest_wavelength * (z + 1)
+                vel_init = c * ((params_to_use[cen_key].init_value / lam_obs0) - 1)
+                vel_fit = c * ((result.params[cen_key].value / lam_obs0) - 1)
+                # v = c·(λ/λ₀ − 1) ⇒ σ_v = c·σ_λ/λ₀ (exact; λ₀ is a constant).
+                _cen_err = result.params[cen_key].stderr
+                vel_std = (c * float(_cen_err) / lam_obs0
+                           if _cen_err is not None and np.isfinite(_cen_err) else np.nan)
             else:
-                vel_init = vel_fit = np.nan
+                vel_init = vel_fit = vel_std = np.nan
 
             fit_entry = {
                 'spaxel_x': cx,
@@ -368,6 +494,7 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
 
                 'vel_init': vel_init,
                 'vel_fit': vel_fit,
+                'vel_std': vel_std,
                 'rest_wavelength': rest_wavelength,
 
                 'sigma_init': params_to_use[sigma_key].init_value,
@@ -376,6 +503,10 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
 
                 'BIC': result.bic,
                 'rchisq': result.redchi,
+                'rchisq_w': rchisq_w,
+                'noise_source': noise_source,
+                'noise_median': noise_median,
+                'noise_npix': n_used,
                 'success': result.success
             }
 
@@ -388,6 +519,7 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
             'spaxel_x': cx,
             'spaxel_y': cy,
             'fit_success': False,
+            'noise_source': noise_source,
             'error': str(e)
         })
         print(f"Fit error for spaxel ({cx},{cy}): {type(e).__name__}: {e}")
@@ -448,6 +580,17 @@ def _worker_init(ctx):
     shm = shared_memory.SharedMemory(name=ctx['shm_name'])
     cube = np.ndarray(ctx['shape'], dtype=np.dtype(ctx['dtype']), buffer=shm.buf)
 
+    # Optional 1σ measurement-error cube, shared the same read-only way.
+    err_shm, err_cube = None, None
+    if ctx.get('err_shm_name'):
+        try:
+            err_shm = shared_memory.SharedMemory(name=ctx['err_shm_name'])
+            err_cube = np.ndarray(ctx['err_shape'], dtype=np.dtype(ctx['err_dtype']),
+                                  buffer=err_shm.buf)
+        except Exception as e:
+            print(f"worker could not attach the error cube: {type(e).__name__}: {e}")
+            err_shm, err_cube = None, None
+
     params = Parameters()
     params.loads(ctx['params_dumps'])
     model = build_model(ctx['n_regions'], ctx['n_lines'])
@@ -470,7 +613,8 @@ def _worker_init(ctx):
     _W.update(shm=shm, cube=cube, params=params, model=model, df=ctx['df'],
               df_cont=ctx['df_cont'], wavelengths=ctx['wavelengths'], z=ctx['z'],
               R=ctx['R'], sequential=ctx['sequential'], max_nfev=ctx['max_nfev'],
-              preps=preps)
+              preps=preps, err_shm=err_shm, err_cube=err_cube,
+              sigma_label=ctx.get('sigma_label'))
 
 
 def _worker_fit_one(task):
@@ -479,6 +623,8 @@ def _worker_fit_one(task):
     i, j, ra, dec = task
     wl = _W['wavelengths']
     flux = np.nan_to_num(_W['cube'][:, j, i].astype(float))
+    err_cube = _W.get('err_cube')
+    sigma_in = None if err_cube is None else np.asarray(err_cube[:, j, i], dtype=float)
 
     stellar_baseline = np.zeros_like(wl, dtype=float)
     stellar_kin, stellar_rows = {}, []
@@ -498,5 +644,5 @@ def _worker_fit_one(task):
     line_rows = fit_one_spaxel(
         flux, stellar_baseline, wl, _W['params'], _W['model'], _W['df'],
         _W['df_cont'], _W['z'], _W['max_nfev'], _W['sequential'], (i, j),
-        ra, dec, stellar_kin)
+        ra, dec, stellar_kin, sigma_in, _W.get('sigma_label'))
     return line_rows, stellar_rows
