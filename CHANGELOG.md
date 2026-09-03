@@ -8,6 +8,121 @@ output formats, and every such change is called out under **Output format** belo
 
 ## [Unreleased]
 
+### Added — blue/red side constraints for broad components
+
+- **Smart Constraints can now hold each broad component on one side of its core.**
+  A line fitted as core + two broad components (Hα + Hα_b + Hα_c) gets one constrained
+  blueward and one redward, with the pairing read from the initial centroid guesses;
+  seeding the two wings apart is what says which is which. A line with only *one* broad
+  component has no pair to read a side from, so the dialog asks: it may sit either side
+  (the previous behaviour), or it is blueshifted, or redshifted. The **AGN Outflow**
+  preset now defaults to blueshifted — the case the preset is named for — and **Shock /
+  LINER** splits pairs but leaves a lone component free.
+- **Why it matters:** with both wings free, the fit cannot distinguish "blue wing at
+  −400 km/s, red at +500" from the same solution with the labels swapped — identical χ².
+  Per-spaxel, that means the blue-wing map and the red-wing map trade places wherever the
+  minimiser happens to land. Verified on a synthetic Hα: from deliberately swapped seeds
+  the unconstrained fit converges with the labels crossed and the sided fit does not, at
+  the same reduced χ².
+- **Blue and red wings are no longer forced into the same K-group.** They were both
+  "secondary" and both landed in K2, which materialises `vel == vel_[ref]` — one shared
+  velocity, i.e. exactly the collapse the two components exist to resolve. Wings are now
+  keyed by side and ionization across K2–K5. With the new options off, the K-group
+  labelling is byte-for-byte what it was.
+### Added — per-component-tier bound table in Smart Constraints
+
+- **A compact table sets the bounds for every component of a tier at once** — one row per
+  tier present in the model (primary = narrowest of each rest-wavelength group, then
+  secondary, tertiary, …), three editable columns:
+  - **Velocity ± km/s** — for non-primary rows, how far that component may sit from its
+    own primary counterpart; each tier carries its own number, so a tertiary can be given
+    more room than a secondary. Works with or without the blue/red split: with it the
+    interval is signed (`-W..0` / `0..W`), without it the distance alone is bounded
+    (`+- W`). Only ever one velocity relation per line, so the two cannot overwrite
+    each other.
+  - **σ / σ_primary** and **amp / amp_primary** — allowed ranges, written `lo..hi`
+    (`inf` allowed). The defaults `1..inf` and `0..1` are exactly the old one-sided
+    "broader and fainter than its core" bounds, so an untouched table reproduces the
+    previous output; narrowing a cell states something stronger in one place
+    (`2..4` = "every secondary is 2–4× the core's width").
+- **The primary row's velocity window is measured from systemic** (rest × 1+z, from the
+  Source *z* field) rather than from each line's own initial guess — the guess just
+  re-centres the window on whatever was typed, which is not a physical statement. Falls
+  back to the old per-line anchor when no redshift is available.
+- Seeded per scenario and reset with one button; an unreadable cell is repaired to its
+  default on Preview rather than silently dropping the constraint. Note the velocity
+  window **replaces** the absolute centroid window on the lines it touches — a constrained
+  centroid is an expression, and lmfit does not apply bounds to expressions — which the
+  preview states in-line.
+- **New constraint syntax: `sigma == LO..HI * sigma_[B]`** (and the same for `amp`), a
+  two-sided ratio range. Two inequalities could not express this: only one `.expr` may be
+  assigned per parameter, so `sigma >= …` followed by `sigma <= …` silently kept whichever
+  came last. The ratio is seeded from the components' own initial guesses, not from the
+  constant 0.9 the generic inequality path uses — that constant is what made the old
+  σ branch need an additive reparameterisation to avoid collapsing the two components.
+  Verified to reproduce the previous path's fit exactly (identical χ² and recovered
+  values) while a tightened range binds at its limit.
+- **New constraint syntax: `vel == vel_[B] LO..HI`**, an explicit signed Δv interval in
+  km/s. The existing one-sided forms (`vel <= vel_[B] + D`) leave the far side open to the
+  edge of the fit window, so a bare "stay blueward" would have *loosened* the velocity
+  range; the interval carries the scenario's own window instead.
+- Fixed, in the same parser: an exact tie reaching `_apply_velocity_constraint` directly
+  raised `min == max` from lmfit (the normal path rewrites ties earlier, so this only bit
+  callers that skipped `update_constraints_with_velocity`); and a constraint overridden by
+  a later one on the same parameter left its helper varying but referenced by nothing — an
+  all-zero Jacobian column that makes the covariance, and so every reported uncertainty on
+  that fit, untrustworthy. Orphaned `offset_*` / `ratio_*` helpers are now frozen. This
+  bites in normal use: a K-group sigma tie is applied *after* Smart Constraints' bounded
+  ratio and overwrites it.
+- The K-group sigma-tie signature (`sigma == <factor> * sigma_[ref]`) matched `1.5..4` as
+  a "factor", so a K-group sync would have stripped Smart Constraints' own bounded-ratio
+  constraint. It now matches a single decimal only.
+
+### Fixed — unreadable numbers on the Fit Parameters buttons
+
+- **Values are formatted to fit their buttons.** `Centroid_0_lowlim` and friends fell
+  through to a raw `str()`, so a button read `6559.108765432109` — 18 characters in a cell
+  sized for about 9, and unreadable without clicking it open. Formatting is now unit-aware
+  (`_fmt_param`): wavelengths get 2 decimals, km/s gets 1, and amplitudes keep significant
+  figures because a flux may be `1e-18` or `1e4`. `inf` renders as `inf` and NaN as blank.
+- `Centroid_0` itself *gained* precision in the process: `_fmt`'s 4 significant figures
+  turned 6592.12 Å into `6592`, discarding 0.14 Å ≈ 6 km/s.
+- The two places that build these buttons had drifted apart (the full-panel rebuild and
+  the single-line append handled the limit columns differently); both now call one shared
+  `_line_button_text`.
+
+### Changed — S/N map is computed once and cached
+
+- **Changing the S/N threshold no longer recomputes the S/N map.** The threshold only
+  picks the contour level; the map itself depends on the cube, the wavelength grid, the
+  line centres and the window widths. It is now cached on exactly those, so the second and
+  subsequent thresholds just redraw the contour. The cache is dropped when the cube, its
+  wavelength axis or its flux scale changes.
+- **The map computation itself is ~27× faster.** Every mask depends only on `wavelengths`
+  and the line centre, never on the spaxel, but they were being rebuilt inside an
+  nx×ny Python loop; each line is now a handful of whole-array operations. On
+  `UGC05101_supercube.fits` (14792 × 146 × 129) with a ten-line model: **19.9 s → 0.74 s**
+  for the first calculation, and free for each threshold after it. Output verified
+  bit-identical to the previous implementation (`max|diff| = 0`), NaN spaxels included.
+
+### Added — extension picker for multi-extension FITS files
+
+- **Opening a file with more than one loadable extension now asks which one to load**
+  instead of silently taking the first that looked like data. The dialog lists every
+  extension HyperCube can ingest (cubes, 1D spectra, tables) with its number, `EXTNAME`,
+  type, dimensions and `BUNIT`, and pre-selects the most likely science array — a spectral
+  cube first, and anything whose name reads as ancillary (`ERR`, `DQ`, `WMAP`, `VAR`, …)
+  last. This matters for JWST `s3d` products, where `SCI`/`ERR`/`DQ`/`WMAP` all have the
+  same shape. Cancelling the dialog leaves the previously loaded cube untouched.
+- **Any extension may now be loaded, not just one carrying its own spectral WCS.** An
+  image extension inherits the cards it does not state itself from the primary header —
+  which is where multi-extension files usually keep `OBJECT`, `REDSHIFT` and often the
+  spectral WCS — and a cube with no `CRVAL3` anywhere falls back to channel indices with a
+  warning rather than failing the load.
+- **Sessions reopen the extension they were built on.** `.hcsession` already recorded
+  `fits_ext`, but restore re-ran the guess and then overwrote the number; it now loads that
+  extension directly and never shows the picker.
+
 ### Fixed — display scaling
 
 - **The UI now follows the display's scale factor.** Qt's high-DPI support was never
