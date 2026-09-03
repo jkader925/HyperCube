@@ -21,6 +21,7 @@ from functools import partial
 import csv
 import gc
 import pickle
+import time
 import psutil
 import os
 from multiprocessing import shared_memory
@@ -127,6 +128,21 @@ global spectrum
 global snr_map
 global snr_value
 snr_value = 0
+
+# Cached S/N map, keyed on everything it depends on EXCEPT the threshold
+# (see FitParamsWindow._snr_map_cache_key). Computing it touches every
+# spaxel of the cube, while the threshold only sets a contour level, so a
+# threshold change must not pay for a recomputation.
+_SNR_CACHE = {'key': None, 'map': None}
+
+
+def invalidate_snr_cache(reason=''):
+    """Drop the cached S/N map. Call from anywhere the cube, its wavelength
+    grid or its flux scale changes underneath the cache key."""
+    global _SNR_CACHE
+    if _SNR_CACHE.get('map') is not None and reason:
+        print(f'S/N map cache cleared ({reason}).')
+    _SNR_CACHE = {'key': None, 'map': None}
 
 data_observation_init = {'sourcename': [''],
                     'redshift': [''],
@@ -710,8 +726,14 @@ def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
     Recognised right-hand sides:
         vel_[B]          → exact tie (Δv = 0)
         vel_[B] +- D     → symmetric window |Δv| ≤ D            (use with ==)
+        vel_[B] LO..HI   → explicit signed interval LO ≤ Δv ≤ HI (use with ==)
         vel_[B] + D      → one-sided threshold +D               (use with <=/>=)
         vel_[B] - D      → one-sided threshold −D               (use with <=/>=)
+
+    The interval form is what keeps a one-sided constraint from *loosening* the
+    fit: `vel <= vel_[B] + 0` says "blueward of B" but leaves the blue side open
+    all the way to the edge of the fit window, whereas `vel == vel_[B] -1500..0`
+    says blueward by at most 1500 km/s.
 
     A two-sided *minimum* separation (|Δv| ≥ D) is intentionally NOT supported:
     it is a disconnected feasible region (a forbidden band around 0) that
@@ -767,6 +789,9 @@ def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
             numstr = tail[2:] if tail.startswith('+-') else tail[1:]
             amp = abs(dlam(abs(float(numstr.replace(' ', '')))))
             lo, hi = -amp, amp
+        elif '..' in tail:
+            lo_kms, hi_kms = (s.strip() for s in tail.split('..', 1))
+            lo, hi = dlam(float(lo_kms)), dlam(float(hi_kms))
         elif tail == '':
             lo = hi = 0.0
         else:
@@ -784,16 +809,92 @@ def _apply_velocity_constraint(found_op, right_side, line_id, df, params):
 
     offset_name = f'offset_vel_{cen_self}_{cen_ref}'
     init = min(max(0.0, lo), hi)
-    if offset_name not in params:
-        params.add(offset_name, value=init, min=lo, max=hi, vary=(lo != hi))
+    # A sided interval ("blueward of the core") has one wall at Δv = 0, which is
+    # exactly where the zero-separation start lands. lmfit maps a doubly-bounded
+    # parameter through arcsin, whose derivative vanishes at the wall, so the
+    # first Jacobian column there is ~0 and the minimiser has to claw its way
+    # off. It does get off (verified), just slower — starting a hair inside
+    # costs nothing and skips the problem.
+    if lo < hi:
+        nudge = min(0.01 * (hi - lo), abs(dlam(25.0)))
+        if nudge > 0:
+            init = min(max(init, lo + nudge), hi - nudge)
+    # A zero-width interval (an exact tie) is a fixed offset, not a bounded one:
+    # lmfit rejects min == max outright. The normal pipeline rewrites exact ties
+    # to a centroid ratio in update_constraints_with_velocity long before they
+    # reach here, but the parser has to stand on its own for anything that calls
+    # it directly.
+    if lo == hi:
+        if offset_name not in params:
+            params.add(offset_name, value=lo, vary=False)
+        else:
+            params[offset_name].set(value=lo, min=-np.inf, max=np.inf, vary=False)
+    elif offset_name not in params:
+        params.add(offset_name, value=init, min=lo, max=hi, vary=True)
     else:
-        params[offset_name].min = lo
-        params[offset_name].max = hi
-        params[offset_name].value = init
-        params[offset_name].vary = (lo != hi)
+        params[offset_name].set(value=init, min=lo, max=hi, vary=True)
     params[cen_self].expr = f'{ratio:.8f} * {cen_ref} + {offset_name}'
     print(f"Velocity constraint: {cen_self} = {ratio:.4f}*{cen_ref} + offset "
           f"∈ [{lo:.4f}, {hi:.4f}] Å")
+    return True
+
+
+def _parse_ratio_range(text):
+    """'LO..HI' -> (lo, hi) floats, or None if `text` is not a range.
+
+    'inf' is accepted on either side, so `1..inf` is "at least as large as",
+    the open-ended form the historical `sigma >= sigma_[core]` expressed.
+    """
+    if '..' not in str(text):
+        return None
+    lo_s, hi_s = (s.strip() for s in str(text).split('..', 1))
+    try:
+        lo, hi = float(lo_s), float(hi_s)
+    except ValueError:
+        return None
+    if np.isnan(lo) or np.isnan(hi):
+        return None
+    return (hi, lo) if lo > hi else (lo, hi)
+
+
+def _apply_ratio_range(param1_name, param2_name, lo, hi, params, label=''):
+    """A == r · B with the ratio r bounded to [lo, hi].
+
+    The ratio is seeded from the two parameters' own initial values, NOT from a
+    fixed constant. That matters: a hardcoded start (the 0.9 the plain `<=`
+    branch below uses) puts a broad component at ~0.9x its core's width no
+    matter what the user asked for, and the two components collapse onto each
+    other before the fit begins. Seeding at σ_broad/σ_core keeps the intended
+    separation.
+    """
+    try:
+        v1 = float(params[param1_name].value)
+        v2 = float(params[param2_name].value)
+    except (TypeError, ValueError):
+        return False
+    init = v1 / v2 if (np.isfinite(v1) and np.isfinite(v2) and v2 != 0) else np.nan
+    if not np.isfinite(init):
+        # No usable guess — start at the low end, or midway in a finite box.
+        init = lo if not np.isfinite(hi) else 0.5 * (lo + hi)
+    init = max(init, lo)
+    if np.isfinite(hi):
+        init = min(init, hi)
+        if lo < hi:                       # keep off the arcsin-transform walls
+            nudge = 0.01 * (hi - lo)
+            init = min(max(init, lo + nudge), hi - nudge)
+    ratio_name = f'ratio_{param1_name}_{param2_name}'
+    if lo == hi:
+        if ratio_name not in params:
+            params.add(ratio_name, value=lo, vary=False)
+        else:
+            params[ratio_name].set(value=lo, min=-np.inf, max=np.inf, vary=False)
+    elif ratio_name not in params:
+        params.add(ratio_name, value=init, min=lo, max=hi, vary=True)
+    else:
+        params[ratio_name].set(value=init, min=lo, max=hi, vary=True)
+    params[param1_name].expr = f'{ratio_name} * {param2_name}'
+    print(f"{label or 'Ratio'} constraint: {param1_name} = {ratio_name} * {param2_name}, "
+          f"{ratio_name} ∈ [{lo:g}, {hi:g}] (init {init:g})")
     return True
 
 
@@ -1036,6 +1137,41 @@ def add_dataframe_constraints_to_params(df, params):
                         print(f"Warning: Centroid constraint must reference another line: {constraint}")
                     continue
 
+                # SPECIAL CASE: a BOUNDED RATIO to another line's parameter,
+                # 'sigma == 1.5..4 * sigma_[core]'. One relation expresses both
+                # sides of a range, which two inequalities cannot: only one
+                # `.expr` can be assigned per parameter, so 'sigma >= …' plus
+                # 'sigma <= …' would silently keep whichever came last.
+                # Handled before the inequality branches so the '..' is not
+                # mistaken for a plain multiplicative factor.
+                if (found_op == '==' and '_[' in right_side and ']' in right_side
+                        and '*' in right_side):
+                    factor_text, ref_text = [s.strip() for s in right_side.split('*', 1)]
+                    # Tolerate the operands in either order ('1..2 * amp_[X]'
+                    # and 'amp_[X] * 1..2' mean the same thing).
+                    if '_[' in factor_text:
+                        factor_text, ref_text = ref_text, factor_text
+                    ratio_range = _parse_ratio_range(factor_text)
+                    if ratio_range is not None:
+                        other_line_name = _ref_line_name(ref_text)
+                        param2_base = ''.join(filter(
+                            str.isalpha, ref_text.split('_[')[0])).lower()
+                        try:
+                            other_row = df[df['Line_Name'] == other_line_name].iloc[0]
+                            param2_name = f"{param2_base}{int(other_row['Line_ID']) + 1}"
+                        except (IndexError, KeyError, ValueError):
+                            print(f"Warning: Could not find line '{other_line_name}' "
+                                  f"for constraint: {constraint}")
+                            continue
+                        if param2_name not in params:
+                            print(f"Warning: Parameter not found in params: {param2_name}")
+                            continue
+                        if not _apply_ratio_range(param1_name, param2_name,
+                                                  ratio_range[0], ratio_range[1],
+                                                  params, label=param1_base.capitalize()):
+                            print(f"Warning: could not apply bounded ratio: {constraint}")
+                        continue
+
                 # SPECIAL CASE: Sigma inequalities use additive offsets.
                 # The ratio method (default) always initialises at ratio=0.9,
                 # making σ_b ≈ σ_core and collapsing the two components.
@@ -1202,6 +1338,26 @@ def add_dataframe_constraints_to_params(df, params):
         except (ValueError, SyntaxError) as e:
             print(f"Warning: Could not parse constraints string for Line_ID {line_id} ({line_name}): {constraints_list_str} - {e}")
 
+    # Two constraints on the same parameter (a K-group sigma tie appended after
+    # Smart Constraints' bounded ratio, say) both assign `.expr`; the last one
+    # wins and the earlier one's helper is left referenced by nothing. A varying
+    # parameter that no expression uses contributes an all-zero Jacobian column,
+    # which makes the covariance singular and every reported uncertainty on the
+    # fit untrustworthy — so freeze the orphans.
+    #
+    # Only `offset_*` / `ratio_*` are considered. Those prefixes are used
+    # exclusively by the helpers created above, and a helper exists solely to be
+    # referenced by an expression, so one that appears in none is dead.
+    live_exprs = ' '.join(p.expr for p in params.values() if p.expr)
+    for name in list(params):
+        if not (name.startswith('offset_') or name.startswith('ratio_')):
+            continue
+        if params[name].vary and name not in live_exprs:
+            # Freeze at the current value, not at 0: a ratio of 0 would be a
+            # meaningful (and wrong) number if anything later re-referenced it.
+            params[name].set(vary=False)
+            print(f"Constraint helper {name} is unused (overridden by a later "
+                  f"constraint on the same parameter) — frozen.")
 
 
 def generalized_model(x, slope, intercept, *gaussian_params):
@@ -1242,6 +1398,29 @@ def _fmt(value, sig=4):
     if abs(v) < 0.001 or abs(v) >= 1e5:
         return f"{v:.{sig-1}e}"
     return f"{v:.{sig}g}"
+
+
+def _fmt_param(value, col_name):
+    """Format a df value for its button, using the column's unit to pick the
+    precision. `_fmt`'s significant figures are wrong for a wavelength — 4 s.f.
+    of 6592.14 Å is "6592", and the discarded 0.14 Å is ~6 km/s — so anything
+    measured in Å gets a fixed 2 decimals instead, and km/s gets 1. Amplitudes
+    keep significant figures, since a flux can be 1e-18 or 1e4.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if np.isnan(v):
+        return ''
+    if np.isinf(v):
+        return '-inf' if v < 0 else 'inf'
+    unit = csv_unit_for(col_name)
+    if unit == 'A':
+        return f'{v:.2f}'
+    if unit == 'kms':
+        return f'{v:.1f}'
+    return _fmt(v)
 
 
 def _as_float_list(v):
@@ -1362,6 +1541,125 @@ def apply_mpl_qss_style(fig, ax, line):
     # Leave enough room for axis labels (tight_layout triggers a compat warning
     # and can still clip labels on small canvases).
     fig.subplots_adjust(left=0.10, right=0.97, bottom=0.12, top=0.97)
+
+
+# ── multi-extension FITS ingest ──────────────────────────────────────────────
+# Structural / bookkeeping cards that must never be inherited from the primary
+# header by an image extension (they describe the *primary* HDU, not this one).
+_HDR_NOT_INHERITED = {
+    'SIMPLE', 'XTENSION', 'BITPIX', 'NAXIS', 'EXTEND', 'PCOUNT', 'GCOUNT',
+    'EXTNAME', 'EXTVER', 'EXTLEVEL', 'BSCALE', 'BZERO', 'BLANK', 'END',
+    'CHECKSUM', 'DATASUM', 'INHERIT',
+}
+
+# Extension names that clearly hold something other than science flux. Used only
+# to rank the pre-selection in the picker — the user can still choose them.
+_ANCILLARY_EXTNAMES = ('ERR', 'ERROR', 'SIG', 'SIGMA', 'NOISE', 'VAR', 'VARIANCE',
+                       'IVAR', 'WEIGHT', 'WHT', 'WMAP', 'DQ', 'MASK', 'FLAG',
+                       'QUAL', 'EXP', 'CON', 'BKG', 'BACKGROUND')
+
+
+def _hdr_get(header, key, default=None):
+    """header.get() that tolerates a missing/odd header object."""
+    try:
+        return header.get(key, default)
+    except Exception:
+        return default
+
+
+def _inherit_primary_cards(header, primary_header):
+    """Return a copy of `header` with cards it lacks filled in from the primary.
+
+    Multi-extension files routinely keep the observation metadata (OBJECT,
+    REDSHIFT, and often the spectral WCS) in the primary HDU while the data sits
+    in an image extension. Only *missing* keys are added, so anything the
+    extension states itself always wins; structural cards are never copied.
+    """
+    if primary_header is None or header is None or primary_header is header:
+        return header
+    try:
+        merged = header.copy()
+        for card in primary_header.cards:
+            key = card.keyword
+            if not key or key in _HDR_NOT_INHERITED or key in ('COMMENT', 'HISTORY'):
+                continue
+            if key.startswith('NAXIS') or key.startswith('TFORM') or key.startswith('TTYPE'):
+                continue
+            if key not in merged:
+                merged[key] = (card.value, card.comment)
+        return merged
+    except Exception as e:
+        print(f'Could not inherit primary-header cards: {e}')
+        return header
+
+
+def _extension_kind(header, data):
+    """Classify one HDU for ingest: 'bintable', '1d', 'cube', or None."""
+    if data is None:
+        return None
+    if _hdr_get(header, 'XTENSION') == 'BINTABLE':
+        return 'bintable'
+    ndim = getattr(data, 'ndim', 0)
+    if ndim == 1:
+        return '1d'
+    if ndim in (3, 4):
+        return 'cube'
+    return None
+
+
+def loadable_extensions(hdul):
+    """List the HDUs of an open HDUList that HyperCube knows how to ingest.
+
+    Returns dicts in file order: {'ext', 'name', 'kind', 'shape', 'bunit',
+    'has_wcs3', 'ncols', 'rank'} — `kind` as per `_extension_kind`, `has_wcs3`
+    True when the extension itself carries a spectral WCS, and `rank` a sort key
+    (lower = better default) used to pre-select the most likely science array.
+    """
+    out = []
+    for ext, hdu in enumerate(hdul):
+        header = hdu.header
+        try:
+            data = hdu.data
+        except Exception as e:
+            print(f'Extension {ext}: unreadable ({e}) — skipped.')
+            continue
+        kind = _extension_kind(header, data)
+        if kind is None:
+            continue
+        name = str(hdu.name or '') or ('PRIMARY' if ext == 0 else f'EXT{ext}')
+        if name.upper() == 'ASDF':
+            continue  # JWST's serialized metadata tree, never science data
+        has_wcs3 = ('CTYPE3' in header and 'CRVAL3' in header)
+        upper = name.upper()
+        ancillary = any(tok in upper.split('_') or upper.startswith(tok)
+                        for tok in _ANCILLARY_EXTNAMES)
+        # Prefer a spectral cube, then a cube without its own WCS, then a 1D
+        # spectrum or table; demote anything whose name says it is not flux.
+        base = {'cube': 0, '1d': 2, 'bintable': 3}[kind]
+        if kind == 'cube' and not has_wcs3:
+            base = 1
+        out.append({
+            'ext': ext,
+            'name': name,
+            'kind': kind,
+            'shape': tuple(int(v) for v in getattr(data, 'shape', ()) or ()),
+            'bunit': _hdr_get(header, 'BUNIT', '') or '',
+            'has_wcs3': has_wcs3,
+            'ncols': int(_hdr_get(header, 'TFIELDS', 0) or 0),
+            'rank': (1 if ancillary else 0, base, ext),
+        })
+    return out
+
+
+def _extension_type_label(cand):
+    """Human-readable data type for one candidate extension."""
+    if cand['kind'] == 'bintable':
+        return f"Table ({cand['ncols']} columns)"
+    if cand['kind'] == '1d':
+        return '1D spectrum'
+    nd = len(cand['shape'])
+    return f'{nd}D cube' + ('' if cand['has_wcs3'] else ' (no spectral WCS)')
+
 
 class SpaxelButton(QPushButton):
     def __init__(self, text, col, *args, **kwargs):
@@ -3306,6 +3604,10 @@ class ViewerWindow(QMainWindow):
         global FITS_DATA, ERROR_CUBE
         self.fluxscalefactor = text_box.text()
         FITS_DATA = FITS_DATA*np.float64(self.fluxscalefactor)
+        # S/N is invariant under a uniform flux scale (signal and noise scale
+        # together), but the cached map belongs to the old array — drop it
+        # rather than reason about which rescalings happen to be harmless.
+        invalidate_snr_cache('flux rescaled')
         # The measurement errors are in the same units as the flux, so they
         # follow the same rescaling.
         if ERROR_CUBE is not None:
@@ -3316,6 +3618,7 @@ class ViewerWindow(QMainWindow):
         global wavelengths
         self.WLscalefactor = text_box.text()
         wavelengths = wavelengths*np.float64(self.WLscalefactor)
+        invalidate_snr_cache('wavelength axis rescaled')
         text_box.hide()
 
     def open_fits_file(self):
@@ -3326,16 +3629,39 @@ class ViewerWindow(QMainWindow):
         if file_path:
             self._load_fits_from_path(file_path)
 
-    def _load_fits_from_path(self, file_path, for_session=False):
+    def _load_fits_from_path(self, file_path, for_session=False, force_ext=None):
         """Load a FITS file from a path (shared by the Open dialog and session
         restore). When for_session=True, the observation-info extraction and
         the source-resolve popup are skipped because the caller restores
-        df_obs from the saved session instead."""
+        df_obs from the saved session instead. `force_ext` loads that extension
+        outright, skipping the multi-extension picker (used by session restore,
+        which already knows which extension the session was built on)."""
         global FITS_HEADER, FITS_DATA, wavelengths, snr_map, spectrum
         if file_path:
-            self.fits_path = file_path
-            self.fits_ext = 0
+            invalidate_snr_cache()
             with fits.open(file_path) as hdul:
+                # Which extension holds the data? Files routinely carry several
+                # (JWST s3d: SCI/ERR/DQ; KCWI supercubes; …), so when more than
+                # one is loadable the user picks instead of us guessing.
+                cands = loadable_extensions(hdul)
+                chosen = None
+                if force_ext is not None:
+                    chosen = next((c for c in cands if c['ext'] == int(force_ext)), None)
+                    if chosen is None:
+                        print(f'Extension {force_ext} is not loadable in '
+                              f'{os.path.basename(file_path)} — falling back to the best guess.')
+                if chosen is None and cands:
+                    default = min(cands, key=lambda c: c['rank'])
+                    if len(cands) > 1 and force_ext is None and not for_session:
+                        chosen = self._choose_fits_extension(file_path, cands, default)
+                        if chosen is None:
+                            print('Open cancelled at the extension picker.')
+                            return
+                    else:
+                        chosen = default
+
+                self.fits_path = file_path
+                self.fits_ext = 0
                 self.fits_header = None
                 self.fits_data = None
                 self.is_1d_spectrum = False
@@ -3343,58 +3669,51 @@ class ViewerWindow(QMainWindow):
                 self.is_3d_cube = False
                 self.column_names = []
                 self.has_explicit_wavelengths = False
-    
-                # Check extensions for data type
-                for ext in range(len(hdul)):
-                    header = hdul[ext].header
+
+                if chosen is not None:
+                    ext = chosen['ext']
                     data = hdul[ext].data
-    
-                    if data is None:
-                        continue
-                        
-                    # Check for binary table
-                    if header.get('XTENSION') == 'BINTABLE':
-                        print(f"Found binary table in extension {ext}")
-                        self.fits_header = header
-                        self.fits_data = data
+                    # An image extension inherits whatever metadata (spectral
+                    # WCS, OBJECT, REDSHIFT) it does not state itself from the
+                    # primary header, which is where MEF files usually keep it.
+                    # Table headers are left alone — their keywords describe the
+                    # table's own columns.
+                    header = hdul[ext].header
+                    if ext != 0 and chosen['kind'] != 'bintable':
+                        header = _inherit_primary_cards(header, hdul[0].header)
+                    self.fits_header = header
+                    self.fits_data = data
+                    self.fits_ext = ext
+                    print(f"Loading extension {ext} ({chosen['name']}): "
+                          f"{_extension_type_label(chosen)} {chosen['shape']}")
+
+                    if chosen['kind'] == 'bintable':
                         self.is_bintable = True
                         spectrum = data
                         self.is_1d_spectrum = True
                         self.column_names = [header.get(f'TTYPE{i}') for i in range(1, header.get('TFIELDS', 0)+1)]
                         if any(col and 'wave' in col.lower() for col in self.column_names):
                             self.has_explicit_wavelengths = True
-                        break
-                    
-                    # Check for 1D spectrum
-                    elif data.ndim == 1:
-                        print(f"Found 1D spectrum in extension {ext}")
-                        self.fits_header = header
-                        self.fits_data = data
+
+                    elif chosen['kind'] == '1d':
                         spectrum = data
                         self.is_1d_spectrum = True
                         self.has_explicit_wavelengths = True
                         if any(key in header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
                             wavelengths = self._construct_wavelengths_from_header()
-                        break
-                    
-                    # Check for 3D/4D cube (like ALMA data)
-                    elif data.ndim in [3, 4] and 'CTYPE3' in header and 'CRVAL3' in header:
-                        print(f"Found {data.ndim}D cube in extension {ext}")
-                        self.fits_header = header
-                        self.fits_data = data
-                        self.fits_ext = ext
+
+                    else:  # 3D/4D cube
                         self.is_3d_cube = True
-                        
+
                         # For ALMA-style cubes (1, nchan, ny, nx)
                         if data.ndim == 4 and data.shape[0] == 1:  # Stokes axis
                             self.fits_data = data[0]  # Remove stokes dimension
-                        
+
                         # Generate wavelength array from header
-                        if 'CTYPE3' in header and header['CTYPE3'].startswith(('FREQ','VELO','VRAD','WAVE')):
+                        if header.get('CTYPE3', '').startswith(('FREQ','VELO','VRAD','WAVE')):
                             wavelengths = self._construct_wavelengths_from_header(axis=3)
                             self.has_explicit_wavelengths = True
-                        break
-    
+
                 # Fallback to primary extension
                 if self.fits_header is None:
                     print("No valid extension found, defaulting to primary.")
@@ -3404,7 +3723,7 @@ class ViewerWindow(QMainWindow):
                         self.is_1d_spectrum = True
                         if any(key in self.fits_header for key in ['CRVAL1', 'CDELT1', 'CD1_1']):
                             self.has_explicit_wavelengths = True
-    
+
                 FITS_HEADER = self.fits_header
                 FITS_DATA = self.fits_data
                 
@@ -3445,6 +3764,71 @@ class ViewerWindow(QMainWindow):
                         self.bkg_image_btn.setEnabled(True)
                 else:
                     self.extract_observation_info()
+
+    def _choose_fits_extension(self, file_path, cands, default):
+        """Ask which extension of a multi-extension file to load.
+
+        `cands` is `loadable_extensions()` output in file order and `default`
+        the best guess (pre-selected). Returns the chosen candidate dict, or
+        None if the user cancelled — in which case nothing is loaded.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Select FITS Extension')
+        dlg.setMinimumWidth(ui_px(620))
+        lay = QVBoxLayout(dlg)
+
+        head = QLabel(f'<b>{os.path.basename(file_path)}</b> contains '
+                      f'{len(cands)} loadable extensions.')
+        lay.addWidget(head)
+        blurb = QLabel('Choose the one to load as the science data. Everything '
+                       'downstream — the map, the spectra and the fit — uses this '
+                       'extension;\nerror / variance extensions belong in '
+                       '"Measurement Errors…" instead.')
+        blurb.setStyleSheet(f'color: gray; {ui_font_css("small")}')
+        lay.addWidget(blurb)
+
+        cols = ['Ext', 'Name', 'Type', 'Dimensions', 'Units']
+        table = QtWidgets.QTableWidget(len(cands), len(cols), dlg)
+        table.setHorizontalHeaderLabels(cols)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        for row, c in enumerate(cands):
+            shape = ' × '.join(str(v) for v in c['shape']) or '—'
+            for col, text in enumerate((str(c['ext']), c['name'],
+                                        _extension_type_label(c), shape,
+                                        str(c['bunit']) or '—')):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setData(Qt.UserRole, row)
+                table.setItem(row, col, item)
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setMinimumHeight(ui_px(160))
+        lay.addWidget(table)
+
+        default_row = cands.index(default)
+        table.selectRow(default_row)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = QPushButton('Cancel')
+        load_btn = QPushButton('Load')
+        load_btn.setDefault(True)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(load_btn)
+        lay.addLayout(btns)
+
+        cancel_btn.clicked.connect(dlg.reject)
+        load_btn.clicked.connect(dlg.accept)
+        # Double-clicking a row loads it straight away.
+        table.doubleClicked.connect(dlg.accept)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        rows = table.selectionModel().selectedRows()
+        row = rows[0].row() if rows else default_row
+        return cands[row]
 
     def detect_measurement_errors(self):
         """Find this cube's 1σ measurement errors, silently.
@@ -3622,11 +4006,13 @@ class ViewerWindow(QMainWindow):
                 f'The cube file referenced by this session was not found:\n{cube_path}')
             return
         try:
-            self._load_fits_from_path(cube_path, for_session=True)
+            # The session recorded which extension it was built on — reload that
+            # one directly instead of re-guessing (or prompting) at restore.
+            self._load_fits_from_path(cube_path, for_session=True,
+                                      force_ext=session.get('fits_ext'))
         except Exception as e:
             QMessageBox.critical(self, 'Load Session', f'Failed to reopen cube:\n{e}')
             return
-        self.fits_ext = session.get('fits_ext', getattr(self, 'fits_ext', 0))
 
         # Restore the measurement-error choice (ingest already ran detection;
         # an explicit saved choice overrides whatever it found).
@@ -3988,11 +4374,19 @@ class ViewerWindow(QMainWindow):
         _, nx, ny = FITS_DATA.shape
         snr_map = np.zeros((nx, ny)) + 1E8
         
-        # Extract spectral axis info
+        # Extract spectral axis info. A cube extension chosen by hand may carry
+        # no spectral WCS at all (and none to inherit) — fall back to channel
+        # indices rather than failing the load.
         spectral_sampling = FITS_HEADER.get('CDELT3', FITS_HEADER.get('CD3_3', 1))
-        wavelengths = (FITS_HEADER['CRVAL3'] + 
-                     spectral_sampling * 
-                     (np.arange(FITS_DATA.shape[0]) - FITS_HEADER.get('CRPIX3', 1) + 1))
+        crval3 = FITS_HEADER.get('CRVAL3')
+        if crval3 is None:
+            print('Warning: no CRVAL3 in this extension - using channel indices '
+                  'for the spectral axis.')
+            wavelengths = np.arange(FITS_DATA.shape[0])
+        else:
+            wavelengths = (crval3 +
+                         spectral_sampling *
+                         (np.arange(FITS_DATA.shape[0]) - FITS_HEADER.get('CRPIX3', 1) + 1))
     
     def extract_observation_info(self):
         """Extract common observation info"""
@@ -6778,6 +7172,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
 
 
+    @staticmethod
+    def _line_button_text(row, col_name):
+        """Text for one line-parameter button. Shared by the full panel rebuild
+        and the single-line append so the two cannot drift apart — they had
+        already drifted into showing raw repr()s for the min/max columns."""
+        if col_name in ('Sigma_0', 'Sigma_0_lowlim', 'Sigma_0_highlim'):
+            # σ stored in Å; displayed as velocity dispersion (km/s)
+            return _fmt_param(sigma_wl_to_kms(row[col_name], row['Centroid_0']), col_name)
+        if 'fit' in col_name.lower() or col_name in ('SNR', 'Rest Wavelength'):
+            return ''
+        return _fmt_param(row[col_name], col_name)
+
     def add_spectral_lines(self, regionID, grid_layout):
         global df_cont, df
         # Add Data (spectral line buttons)
@@ -6798,19 +7204,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             for col, col_name in enumerate(button_columns):
                 # print(type(df_region.iloc[row][col_name]),df_region.iloc[row][col_name])
                 button_name = str(np.int64(df_region.iloc[row]['Line_ID']))+'~'+str(col_name)
-                if col_name in ('Sigma_0', 'Sigma_0_lowlim', 'Sigma_0_highlim'):
-                    # σ stored in Å; displayed as velocity dispersion (km/s)
-                    button_text = _fmt(sigma_wl_to_kms(df_region.iloc[row][col_name],
-                                                       df_region.iloc[row]['Centroid_0']))
-                elif col_name in ['Rest Wavelength', 'Amp_0', 'Centroid_0']:
-                    button_text = _fmt(df_region.iloc[row][col_name])
-                else:
+                button_text = self._line_button_text(df_region.iloc[row], col_name)
 
-                    if ('fit' in col_name.lower()) | ('SNR' in col_name) | ('Rest' in col_name):
-                        button_text = ''
-                    else:
-                        button_text = str(df_region.iloc[row][col_name])
-                        
                 # button_text = str(df_region.iloc[row][col_name]) if 'fit' not in col_name.lower() else ''
                 button = FrameButton(button_text, row, col, regionID, button_name)
                 # button.setStyleSheet("""
@@ -8908,87 +9303,135 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
 
 
+    def _snr_map_cache_key(self, linewl, search_window_width, continuum_offset, continuum_width):
+        """Everything the S/N map depends on — deliberately NOT the threshold.
+
+        The map is a property of the cube, the wavelength grid, the line centres
+        and the three window widths; `Nsigma` only picks the contour level drawn
+        on top of it. Keyed on the cube's identity rather than its contents: a
+        (14792, 146, 129) cube is far too large to hash, and every path that
+        replaces or rescales the array calls `invalidate_snr_cache()`.
+        """
+        vw = self.viewer_window
+        try:
+            centroids = tuple(np.round(df['Centroid_0'].astype(float).to_numpy(), 6))
+        except (KeyError, TypeError, ValueError):
+            centroids = ()
+        wl = wavelengths
+        wl_sig = ((len(wl), round(float(wl[0]), 8), round(float(wl[-1]), 8))
+                  if wl is not None and len(wl) else ())
+        # `linewl` does not currently enter the computation (the loop reads
+        # Centroid_0 straight off df), but it is keyed anyway so that if it ever
+        # starts to, a stale map cannot survive the change.
+        return (
+            str(getattr(vw, 'fits_path', '')), int(getattr(vw, 'fits_ext', 0)),
+            tuple(np.shape(FITS_DATA)), wl_sig, centroids,
+            tuple(_as_float_list(linewl)),
+            search_window_width, continuum_offset, continuum_width,
+        )
+
+    def compute_snr_map(self, search_window_width, continuum_offset, continuum_width):
+        """The S/N map itself: per spaxel, the best S/N over all lines in `df`.
+
+        S/N per line = (95th-percentile flux in a window around the line centre)
+        / (MAD-based noise in the two continuum flanks). Every mask depends only
+        on `wavelengths` and the line centre — not on the spaxel — so each line
+        is one pass of whole-array operations rather than nx·ny Python
+        iterations.
+        """
+        _, nx, ny = np.shape(FITS_DATA)
+        per_line = []
+        for _, row in df.iterrows():
+            line_center = row['Centroid_0']
+            try:
+                line_center = float(line_center)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(line_center):
+                continue
+
+            line_mask = ((wavelengths >= line_center - search_window_width / 2) &
+                         (wavelengths <= line_center + search_window_width / 2))
+            # Both flanks in one mask: the noise is a median, which does not care
+            # about the order the two sides are concatenated in.
+            cont_mask = (((wavelengths >= line_center - continuum_offset - continuum_width) &
+                          (wavelengths <= line_center - continuum_offset)) |
+                         ((wavelengths <= line_center + continuum_offset + continuum_width) &
+                          (wavelengths >= line_center + continuum_offset)))
+
+            peak_flux = (np.percentile(FITS_DATA[line_mask], 95, axis=0)
+                         if line_mask.any() else np.zeros((nx, ny)))
+            if cont_mask.sum() > 1:
+                cont = FITS_DATA[cont_mask]
+                noise = 1.4826 * np.median(np.abs(cont - np.median(cont, axis=0)), axis=0)
+            else:
+                noise = np.full((nx, ny), np.nan)
+
+            with np.errstate(divide='ignore', invalid='ignore'):
+                usable = np.isfinite(noise) & (noise > 0)
+                per_line.append(np.where(usable, peak_flux / np.where(usable, noise, 1.0), 0.0))
+
+        if not per_line:
+            return np.zeros((nx, ny))
+        with warnings.catch_warnings():
+            # A spaxel that is NaN in every line's window has no S/N to report;
+            # nanmax says so with a warning and a NaN, which is the answer.
+            warnings.simplefilter('ignore', RuntimeWarning)
+            return np.nanmax(np.stack(per_line, axis=0), axis=0)
+
     def calculate_snr_map(self, linewl, Nsigma, search_window_width=None, continuum_offset=None, continuum_width=None):
         """
-        Calculate an SNR map using wavelength units (same as 'wavelengths' array).
-        
+        Calculate an SNR map using wavelength units (same as 'wavelengths' array),
+        and draw the `Nsigma` contour over the cube image.
+
+        The map is cached: `Nsigma` does not enter the computation at all, so
+        changing only the threshold reuses the stored map and just redraws the
+        contour.
+
         Parameters:
-            linewl (float or array-like): Central wavelength(s) of the emission line(s) 
+            linewl (float or array-like): Central wavelength(s) of the emission line(s)
             Nsigma (float): SNR threshold for contour drawing
             search_window_width (float): Width of search window around line center (in wavelength units)
             continuum_offset (float): Offset from line center to start continuum regions (in wavelength units)
             continuum_width (float): Width of continuum regions (in wavelength units)
-        
+
         Returns:
             snr_map (numpy.ndarray): 2D array of max SNR values across emission lines for each spaxel
         """
-        global snr_map
-        num_wavelengths, nx, ny = np.shape(FITS_DATA)
-        snr_map = np.zeros((nx, ny))
-        
+        global snr_map, _SNR_CACHE
+
         # Set default window sizes if not specified
         if search_window_width is None:
             search_window_width = 50 * np.median(np.diff(wavelengths))  # 10x wavelength step
-        
+
         if continuum_offset is None:
             continuum_offset = 60 * np.median(np.diff(wavelengths))  # 20x wavelength step
-        
+
         if continuum_width is None:
             continuum_width = 70 * np.median(np.diff(wavelengths))  # 30x wavelength step
-    
-        print(f'Calculating S/N map for line_wl = {linewl}, masking at {Nsigma}-sigma!')
-    
-        for i in range(nx):
-            for j in range(ny):
-                spectrum = FITS_DATA[:, i, j]
-                snr_values = []
-                
-                for index, row in df.iterrows():
-                    line_center = row['Centroid_0']  # Line center in wavelength units
-                    
-                    # Define line region
-                    line_mask = (wavelengths >= line_center - search_window_width/2) & \
-                               (wavelengths <= line_center + search_window_width/2)
-                    line_region = spectrum[line_mask]
-                    
-                    # Use robust maximum for peak flux
-                    peak_flux = np.percentile(line_region, 95) if len(line_region) > 0 else 0
-                    
-                    # Define continuum regions (both sides of line)
-                    left_cont_mask = (wavelengths >= line_center - continuum_offset - continuum_width) & \
-                                    (wavelengths <= line_center - continuum_offset)
-                    right_cont_mask = (wavelengths <= line_center + continuum_offset + continuum_width) & \
-                                     (wavelengths >= line_center + continuum_offset)
-                    
-                    # Combine continuum regions
-                    continuum_flux = np.concatenate([
-                        spectrum[left_cont_mask],
-                        spectrum[right_cont_mask]
-                    ])
-                    
-                    # Compute noise as MAD scaled to STD (robust against outliers)
-                    if len(continuum_flux) > 1:
-                        noise_level = 1.4826 * np.median(np.abs(continuum_flux - np.median(continuum_flux)))
-                    else:
-                        noise_level = np.nan
-                    
-                    # Compute SNR if valid
-                    if noise_level > 0 and not np.isnan(noise_level):
-                        snr = peak_flux / noise_level
-                        snr_values.append(snr)
-                    else:
-                        snr_values.append(0)
-                
-                # Store maximum SNR for this spaxel
-                snr_map[i, j] = np.nanmax(snr_values) if snr_values else 0
-    
+
+        key = self._snr_map_cache_key(linewl, search_window_width,
+                                      continuum_offset, continuum_width)
+        cached = _SNR_CACHE.get('map') if _SNR_CACHE.get('key') == key else None
+        if cached is not None:
+            snr_map = cached
+            print(f'Re-using the cached S/N map; masking at {Nsigma}-sigma.')
+        else:
+            print(f'Calculating S/N map for line_wl = {linewl}, masking at {Nsigma}-sigma!')
+            t0 = time.perf_counter()
+            snr_map = self.compute_snr_map(search_window_width, continuum_offset,
+                                           continuum_width)
+            _SNR_CACHE = {'key': key, 'map': snr_map}
+            print(f'  S/N map computed in {time.perf_counter() - t0:.2f} s '
+                  f'(cached — changing the threshold alone will reuse it).')
+
         # Draw the contour on the viewer window at the specified Nsigma level
         contour = self.viewer_window.ax.contour(snr_map, levels=[Nsigma], colors='red', linewidths=1.5)
-    
+
         # Update the canvas
         self.viewer_window.canvas.draw()
         self.viewer_window.spectrum_canvas.draw_idle()
-        
+
         return snr_map
 
 
@@ -9321,7 +9764,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         # ── Toggles ──────────────────────────────────────────────────────
         v.addWidget(QLabel('<b>Options:</b>'))
-        kgroup_cb = QCheckBox('Assign K-groups (core → K1, secondary → K2/K3)', dlg)
+        kgroup_cb = QCheckBox('Assign K-groups (core → K1, secondary → K2–K5)', dlg)
         v.addWidget(kgroup_cb)
 
         ion_row = QHBoxLayout()
@@ -9337,6 +9780,133 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         bounds_cb = QCheckBox('Set absolute sigma / centroid bounds per scenario', dlg)
         v.addWidget(bounds_cb)
+
+        # ── Velocity offset of the broad components from their core ──────
+        vel_row = QHBoxLayout()
+        vel_cb = QCheckBox('Limit each component\'s velocity offset '
+                           '(per-component amounts in the table below)', dlg)
+        vel_row.addWidget(vel_cb); vel_row.addStretch()
+        v.addLayout(vel_row)
+
+        # ── Per-component-tier bound table ───────────────────────────────
+        # One row per component tier actually present in the model, so a single
+        # edit sets every primary / every secondary / every tertiary at once —
+        # which is the whole point of doing it here rather than line-by-line in
+        # the Fit Parameters panel.
+        tier_header = QHBoxLayout()
+        tier_header.addWidget(QLabel('<b>Per-component bounds:</b>', dlg))
+        tier_header.addStretch()
+        reset_btn = QPushButton('Reset to scenario defaults', dlg)
+        tier_header.addWidget(reset_btn)
+        v.addLayout(tier_header)
+
+        tier_cols = ['Component', 'Velocity ± km/s', 'σ / σ_primary', 'amp / amp_primary']
+        tier_table = QtWidgets.QTableWidget(0, len(tier_cols), dlg)
+        tier_table.setHorizontalHeaderLabels(tier_cols)
+        tier_table.verticalHeader().setVisible(False)
+        tier_table.horizontalHeader().setStretchLastSection(True)
+        tier_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        v.addWidget(tier_table)
+
+        tier_note = QLabel(
+            'Ranges are written as <tt>lo..hi</tt> (<tt>inf</tt> allowed): '
+            '<tt>1..inf</tt> = "at least as broad as its primary", '
+            '<tt>0..1</tt> = "no brighter than its primary". The primary row\'s '
+            'velocity is measured from <b>systemic</b> (rest × 1+z); every other '
+            'row from that line\'s own primary component.', dlg)
+        tier_note.setWordWrap(True)
+        tier_note.setStyleSheet(f'color: gray; {ui_font_css("small")}')
+        v.addWidget(tier_note)
+
+        def _populate_tier_table(scenario_key):
+            """Fill the table with this scenario's defaults, one row per tier
+            the model uses. Ratio cells are meaningless for the primary (it is
+            its own reference), so those two cells are blanked and locked."""
+            present = hcsc.tiers_present(df) or [1]
+            defaults = hcsc.default_tier_bounds(scenario_key, present)
+            tier_table.setRowCount(len(present))
+            for r, tier in enumerate(present):
+                b = defaults[tier]
+                label = QtWidgets.QTableWidgetItem(hcsc.tier_label(tier))
+                label.setFlags(Qt.ItemIsEnabled)
+                label.setData(Qt.UserRole, int(tier))
+                tier_table.setItem(r, 0, label)
+                tier_table.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{b['dv_kms']:g}"))
+                if tier == 1:
+                    for c in (2, 3):
+                        cell = QtWidgets.QTableWidgetItem('—')
+                        cell.setFlags(Qt.ItemIsEnabled)
+                        cell.setTextAlignment(Qt.AlignCenter)
+                        tier_table.setItem(r, c, cell)
+                else:
+                    tier_table.setItem(r, 2, QtWidgets.QTableWidgetItem(
+                        hcsc._ratio_text(*b['sigma_ratio'])))
+                    tier_table.setItem(r, 3, QtWidgets.QTableWidgetItem(
+                        hcsc._ratio_text(*b['amp_ratio'])))
+            tier_table.resizeColumnsToContents()
+            tier_table.horizontalHeader().setStretchLastSection(True)
+            # Keep the table exactly as tall as its rows — it is a few rows at
+            # most, and a scrollbar on three rows just hides them.
+            h = tier_table.horizontalHeader().height() + 2
+            for r in range(tier_table.rowCount()):
+                h += tier_table.rowHeight(r)
+            tier_table.setFixedHeight(h + ui_px(4))
+
+        def _read_tier_table():
+            """The table as build_plan's `tier_bounds`. Unreadable cells fall
+            back to the scenario default rather than silently dropping the
+            constraint, and are repaired in place so the user sees what applied."""
+            scenario_key = next(k for k, rb in scenario_buttons.items() if rb.isChecked())
+            out = {}
+            for r in range(tier_table.rowCount()):
+                label = tier_table.item(r, 0)
+                if label is None:
+                    continue
+                tier = int(label.data(Qt.UserRole))
+                default = hcsc.default_tier_bounds(scenario_key, [tier])[tier]
+                dv = _safe_float(tier_table.item(r, 1).text()
+                                 if tier_table.item(r, 1) else '')
+                if not (np.isfinite(dv) and dv > 0):
+                    dv = default['dv_kms']
+                    tier_table.setItem(r, 1, QtWidgets.QTableWidgetItem(f'{dv:g}'))
+                entry = {'dv_kms': dv}
+                if tier != 1:
+                    for col, key in ((2, 'sigma_ratio'), (3, 'amp_ratio')):
+                        cell = tier_table.item(r, col)
+                        rng = _parse_ratio_range(cell.text() if cell else '')
+                        if rng is None:
+                            rng = default[key]
+                            tier_table.setItem(r, col, QtWidgets.QTableWidgetItem(
+                                hcsc._ratio_text(*rng)))
+                        entry[key] = rng
+                out[tier] = entry
+            return out
+
+        # ── Blue / red side of the broad components ──────────────────────
+        side_cb = QCheckBox('Keep each broad component on one side of its core '
+                            '(blue/red, read from the initial guesses)', dlg)
+        v.addWidget(side_cb)
+
+        lone_row = QHBoxLayout()
+        lone_row.setContentsMargins(ui_px(22), 0, 0, 0)
+        lone_label = QLabel('A line with only one broad component:', dlg)
+        lone_combo = QComboBox(dlg)
+        for label, key in (('may sit either side', 'free'),
+                           ('is blueshifted', 'blue'),
+                           ('is redshifted', 'red')):
+            lone_combo.addItem(label, key)
+        lone_row.addWidget(lone_label); lone_row.addWidget(lone_combo); lone_row.addStretch()
+        v.addLayout(lone_row)
+
+        def _sync_side_enabled():
+            for w in (lone_label, lone_combo):
+                w.setEnabled(side_cb.isChecked())
+            # The table drives the velocity limit, the blue/red sign, AND the
+            # σ/amp ratios, so it is live whenever any of those is switched on.
+            tier_table.setEnabled(vel_cb.isChecked() or side_cb.isChecked()
+                                  or rel_cb.isChecked() or bounds_cb.isChecked())
+        for _w in (side_cb, vel_cb, rel_cb, bounds_cb):
+            _w.toggled.connect(_sync_side_enabled)
 
         dens_row = QHBoxLayout()
         dens_row.addWidget(QLabel('Density-sensitive doublets ([S II], [O II]):'))
@@ -9364,20 +9934,47 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         note.setStyleSheet(f'color: gray; {ui_font_css("small")}')
         v.addWidget(note)
 
+        def _set_lone(key):
+            idx = lone_combo.findData(key)
+            if idx >= 0:
+                lone_combo.setCurrentIndex(idx)
+
         def _apply_scenario_defaults():
             key = next(k for k, rb in scenario_buttons.items() if rb.isChecked())
+            # Each scenario's own idea of how far a component can sit from its
+            # reference; the table is a starting point, not a lock.
+            _populate_tier_table(key)
             if key == 'quiescent':
                 kgroup_cb.setChecked(True); ion_cb.setChecked(False)
                 rel_cb.setChecked(True); bounds_cb.setChecked(True)
                 dens_fix.setChecked(True); balmer_float.setChecked(True)
-            elif key in ('outflow', 'shock'):
+                side_cb.setChecked(False); _set_lone('free')
+                vel_cb.setChecked(False)
+            elif key == 'outflow':
                 kgroup_cb.setChecked(True); ion_cb.setChecked(True)
                 rel_cb.setChecked(True); bounds_cb.setChecked(True)
                 dens_float.setChecked(True); balmer_float.setChecked(True)
+                # The AGN case the preset is named for: the wing is the
+                # approaching side of the outflow, its receding counterpart
+                # obscured by the disk. A line carrying both wings still gets
+                # one of each — the pairing is read from the guesses.
+                side_cb.setChecked(True); _set_lone('blue')
+                vel_cb.setChecked(True)
+            elif key == 'shock':
+                kgroup_cb.setChecked(True); ion_cb.setChecked(True)
+                rel_cb.setChecked(True); bounds_cb.setChecked(True)
+                dens_float.setChecked(True); balmer_float.setChecked(True)
+                # Shocks are not preferentially approaching, so a lone broad
+                # component stays free; a blue/red pair is still split.
+                side_cb.setChecked(True); _set_lone('free')
+                vel_cb.setChecked(True)
             else:  # custom
                 kgroup_cb.setChecked(False); ion_cb.setChecked(False)
                 rel_cb.setChecked(False); bounds_cb.setChecked(False)
                 dens_fix.setChecked(True); balmer_float.setChecked(True)
+                side_cb.setChecked(False); _set_lone('free')
+                vel_cb.setChecked(False)
+            _sync_side_enabled()
 
         dens_fix.setChecked(True)
         balmer_float.setChecked(True)
@@ -9408,6 +10005,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 assign_kgroups=kgroup_cb.isChecked(),
                 add_relational_bounds=rel_cb.isChecked(),
                 set_absolute_bounds=bounds_cb.isChecked(),
+                wing_sides='split' if side_cb.isChecked() else 'free',
+                lone_wing_side=lone_combo.currentData(),
+                limit_velocity_offset=vel_cb.isChecked(),
+                # Unreadable cells fall back to the scenario's own defaults
+                # rather than dropping the constraint.
+                tier_bounds=_read_tier_table(),
+                redshift=_safe_float(df_obs.loc[0, 'redshift'])
+                         if len(df_obs) else np.nan,
                 ip_threshold=ip_threshold)
 
         def _preview():
@@ -9421,6 +10026,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 assign_kgroups=settings['assign_kgroups'],
                 add_relational_bounds=settings['add_relational_bounds'],
                 set_absolute_bounds=settings['set_absolute_bounds'],
+                wing_sides=settings['wing_sides'],
+                lone_wing_side=settings['lone_wing_side'],
+                limit_velocity_offset=settings['limit_velocity_offset'],
+                tier_bounds=settings['tier_bounds'],
+                redshift=settings['redshift'],
                 ip_threshold=settings['ip_threshold'],
                 line_library=line_lib)
             state['plan'] = plan
@@ -9433,11 +10043,19 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             preview_box.setPlainText('(settings changed — click Preview to refresh)')
 
         for w in (kgroup_cb, ion_cb, rel_cb, bounds_cb, dens_fix, dens_float,
-                  balmer_float, balmer_fix):
+                  balmer_float, balmer_fix, side_cb, vel_cb):
             w.toggled.connect(_invalidate_preview)
         for rb in scenario_buttons.values():
             rb.toggled.connect(lambda checked: _invalidate_preview() if checked else None)
         ion_edit.textChanged.connect(_invalidate_preview)
+        tier_table.itemChanged.connect(_invalidate_preview)
+        lone_combo.currentIndexChanged.connect(_invalidate_preview)
+
+        def _reset_tiers():
+            _populate_tier_table(next(k for k, rb in scenario_buttons.items()
+                                      if rb.isChecked()))
+            _invalidate_preview()
+        reset_btn.clicked.connect(_reset_tiers)
 
         brow = QHBoxLayout()
         help_btn = QPushButton('?', dlg)
@@ -9493,8 +10111,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             "otherwise set line-by-line in the Edit Line dialog, for every "
             "line in the model at once:<br><br>"
             "&nbsp;&nbsp;• <b>K-groups</b> — core (narrowest of each "
-            "rest-wavelength group) → K1; broader partners → K2 (or K2/K3 "
-            "split by ionization potential).<br>"
+            "rest-wavelength group) → K1; broader partners → K2, split further "
+            "across K2–K5 by ionization potential and by blue/red side, since "
+            "one K-group means one shared velocity.<br>"
             "&nbsp;&nbsp;• <b>Atomic-fixed doublets</b> — [N II] 6548/6584 "
             "and [O III] 4959/5007 flux ratios, always fixed when both "
             "lines are present.<br>"
@@ -9503,10 +10122,38 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             "or floated within the physical range.<br>"
             "&nbsp;&nbsp;• <b>Balmer decrement</b> — Hα/Hβ, floated to "
             "measure reddening, or fixed to case B (2.86).<br>"
-            "&nbsp;&nbsp;• <b>Relational bounds</b> — secondary components "
-            "get sigma ≥ core's and amp ≤ core's (broader + fainter).<br>"
-            "&nbsp;&nbsp;• <b>Absolute bounds</b> — per-scenario sigma / "
-            "centroid windows (km/s).<br><br>"
+            "&nbsp;&nbsp;• <b>Per-component bounds table</b> — one row per "
+            "component tier present in the model (primary = narrowest of each "
+            "rest-wavelength group, then secondary, tertiary, …). Editing a row "
+            "sets <i>every</i> line of that tier at once, which is the point of "
+            "doing it here rather than line-by-line in the Fit Parameters "
+            "panel:<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;– <i>Velocity ± km/s</i> — for the primary "
+            "row, how far its velocity may stray from <b>systemic</b> "
+            "(rest × 1+z, from the Source z field); for every other row, how far "
+            "that component may sit from its own primary counterpart. This "
+            "<i>replaces</i> the absolute centroid window on the lines it "
+            "touches — a constrained centroid is an expression, and lmfit does "
+            "not apply bounds to expressions.<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;– <i>σ / σ_primary</i> and "
+            "<i>amp / amp_primary</i> — allowed ranges written "
+            "<tt>lo..hi</tt> (<tt>inf</tt> allowed). The defaults "
+            "<tt>1..inf</tt> and <tt>0..1</tt> are the old "
+            "\"broader and fainter than its core\" bounds; narrow them to say "
+            "something stronger, e.g. <tt>2..4</tt> for \"every secondary is "
+            "2–4× the core's width\".<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<i>Reset to scenario defaults</i> restores "
+            "the whole table; an unreadable cell is repaired to its default "
+            "when you Preview.<br>"
+            "&nbsp;&nbsp;• <b>Blue/red side</b> — each broad component is held "
+            "on one side of its core (the same Δv limit, but signed). "
+            "A line with two broad components gets one of each, with "
+            "the pairing read from your initial centroid guesses; seed them "
+            "apart to say which is which. A line with only one broad component "
+            "has no pair to read, so the dropdown decides: free, blueshifted "
+            "or redshifted.<br>"
+            "&nbsp;&nbsp;• <b>Absolute bounds</b> — per-scenario sigma windows, "
+            "and the velocity windows from the table above (km/s).<br><br>"
             "Re-running Smart Constraints replaces its own previous output "
             "(picking a new scenario, toggling options) without touching "
             "constraints you typed by hand in the Edit Line dialog."
@@ -11072,16 +11719,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         for col, col_name in enumerate(button_columns):
             button_name = str(np.int64(df_region.iloc[last_row_idx]['Line_ID'])) + '~' + col_name
-            if col_name in ('Sigma_0', 'Sigma_0_lowlim', 'Sigma_0_highlim'):
-                # σ stored in Å; displayed as velocity dispersion (km/s)
-                button_text = _fmt(sigma_wl_to_kms(df_region.iloc[last_row_idx][col_name],
-                                                   df_region.iloc[last_row_idx]['Centroid_0']))
-            elif col_name in ['Rest Wavelength', 'Amp_0', 'Centroid_0']:
-                button_text = _fmt(df_region.iloc[last_row_idx][col_name])
-            elif 'fit' in col_name.lower() or col_name in ('SNR', 'Rest Wavelength'):
-                button_text = ''
-            else:
-                button_text = str(df_region.iloc[last_row_idx][col_name])
+            button_text = self._line_button_text(df_region.iloc[last_row_idx], col_name)
             btn = FrameButton(button_text, last_row_idx, col, frame_id, button_name)
             btn.setFixedHeight(ui_px(24))
             if 'fit' in col_name:
@@ -11905,7 +12543,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     # Signature identifying a K-group-managed dispersion tie: equality WITH a
     # numeric factor (e.g. 'sigma == 1.002255 * sigma_[ref]'). This lets us
     # strip K-group ties without touching a user's 'sigma <=/>= sigma_[X]'.
-    _KG_SIGMA_RE = re.compile(r'sigma\s*==\s*[\d.]+\s*\*\s*sigma_\[')
+    # A single decimal factor, deliberately NOT a range: `[\d.]+` also matches
+    # '1.5..4', which would make a K-group sync strip Smart Constraints' own
+    # bounded-ratio constraint (they are different relations and must not
+    # cannibalise each other).
+    _KG_SIGMA_RE = re.compile(r'sigma\s*==\s*\d+(?:\.\d+)?\s*\*\s*sigma_\[')
     # K-group-managed velocity tie is the *exact* form 'vel == vel_[ref]'
     # (anchored, no trailing window). This must NOT match a user's manual
     # velocity window/one-sided form ('vel == vel_[B] +- 300', 'vel <= ...').
@@ -11918,8 +12560,22 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     # one of these forms is treated as smart-managed too — same accepted
     # trade-off as the K-group tie signatures above.
     _SMART_FLUX_RE = re.compile(r'^\s*flux\s*==\s*[\d.]+(?:\.\.[\d.]+)?\s*\*\s*flux_\[')
-    _SMART_SIGMA_REL_RE = re.compile(r'^\s*sigma\s*>=\s*sigma_\[')
-    _SMART_AMP_REL_RE = re.compile(r'^\s*amp\s*<=\s*amp_\[')
+    # Each matches BOTH the current bounded-ratio form ('sigma == 1.5..4 *
+    # sigma_[core]') and the one-sided form Smart Constraints used to write
+    # ('sigma >= sigma_[core]'), so re-running still replaces the output of an
+    # older version rather than stacking a second relation on top of it.
+    _RATIO_NUM = r'(?:[\d.]+|inf)'
+    _SMART_SIGMA_REL_RE = re.compile(
+        rf'^\s*sigma\s*(?:>=\s*sigma_\[|==\s*{_RATIO_NUM}\s*\.\.\s*{_RATIO_NUM}\s*\*\s*sigma_\[)')
+    _SMART_AMP_REL_RE = re.compile(
+        rf'^\s*amp\s*(?:<=\s*amp_\[|==\s*{_RATIO_NUM}\s*\.\.\s*{_RATIO_NUM}\s*\*\s*amp_\[)')
+    # Velocity offset constraint on a broad component: a signed Δv interval
+    # ('-1500..0') when the side is pinned, a symmetric window ('+- 1500') when
+    # only the distance is. The trailing window is what distinguishes both from
+    # a K-group velocity tie, so _KG_VEL_RE (anchored on a closing bracket)
+    # cannot match either and the two rewrite paths stay independent.
+    _SMART_VEL_SIDE_RE = re.compile(
+        r'^\s*vel\s*==\s*vel_\[.*\]\s*(?:[-+\d.]+\s*\.\.\s*[-+\d.]+|[-+]-\s*[\d.]+|±\s*[\d.]+)\s*$')
 
     def _rewrite_smart_constraints(self, line_name, add=None):
         """Rewrite a line's constraints, replacing only Smart-Constraints-
@@ -11939,7 +12595,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             kept = [c for c in clist if c.strip()
                     and not self._SMART_FLUX_RE.match(c)
                     and not self._SMART_SIGMA_REL_RE.match(c)
-                    and not self._SMART_AMP_REL_RE.match(c)]
+                    and not self._SMART_AMP_REL_RE.match(c)
+                    and not self._SMART_VEL_SIDE_RE.match(c)]
             if add:
                 kept = kept + list(add)
             kept = kept[-5:]
@@ -12104,10 +12761,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # σ bounds are entered in km/s; store the Å equivalent
                 cen0 = df.loc[rowmask, 'Centroid_0'].iloc[0]
                 new_value = sigma_kms_to_wl(entered, cen0)
-                display = _fmt(entered)
+                display = _fmt_param(entered, param)
             else:
                 new_value = entered
-                display = new_value
+                display = _fmt_param(new_value, param)
             df.loc[rowmask, param] = new_value
             self.update_button_value(frame_id, button_name, display)
             
