@@ -34,6 +34,14 @@ import matplotlib.patches as patches
 
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.io.fits.verify import VerifyWarning
+
+# ESO/MUSE headers carry thousands of long "HIERARCH ESO ..." keywords, and
+# astropy emits one VerifyWarning per card every time such a header is copied
+# or rebuilt.  The HIERARCH convention is exactly what we want here, so the
+# warning carries no information -- and formatting tens of thousands of them
+# through astropy's logger visibly stalls cube ingest.
+warnings.filterwarnings('ignore', category=VerifyWarning)
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QTimer, QSize, QSettings
