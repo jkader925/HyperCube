@@ -44,14 +44,14 @@ from astropy.io.fits.verify import VerifyWarning
 warnings.filterwarnings('ignore', category=VerifyWarning)
 
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QSize, QSettings
+from PyQt5.QtCore import Qt, QTimer, QSize, QSettings, QEventLoop
 from PyQt5.QtWidgets import (
     QVBoxLayout, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QWidget, QLabel, QFrame, QMenu, QTextEdit, QMainWindow,
     QHBoxLayout, QMenuBar, QProgressBar, QDialog, QSplashScreen,
     QAction, QSplitter, QFileDialog, QApplication, QGroupBox, QMessageBox,
     QDockWidget, QComboBox, QScrollBar, QCheckBox, QRadioButton, QButtonGroup)
-from PyQt5.QtGui import QFontMetrics, QPixmap, QGuiApplication
+from PyQt5.QtGui import QFontMetrics, QPixmap, QGuiApplication, QCursor
 from PyQt5.QtGui import QKeySequence
 
 from lmfit import Model, Parameters
@@ -59,6 +59,9 @@ from lmfit import Model, Parameters
 import HyperCube_ModelFunctions
 import HyperCube_fit  # Qt-free per-spaxel fit kernel (shared by serial + parallel)
 import HyperCube_Noise  # Qt-free variance/error-cube discovery + empirical noise
+import HyperCube_LSF    # Qt-free instrument line-spread functions
+import HyperCube_Templates as hct  # Qt-free rest-frame model templates
+import HyperCube_Quality as hcq  # Qt-free fit-quality criteria (Rectify goodness)
 import HyperCube_SmartConstraints as hcsc  # Qt-free auto-constraint/K-group logic
 try:
     import HyperCube_pPXF as hcppxf
@@ -143,6 +146,101 @@ snr_value = 0
 # threshold change must not pay for a recomputation.
 _SNR_CACHE = {'key': None, 'map': None}
 
+# Bumped whenever the S/N formula itself changes, so a map cached by an older
+# definition cannot survive into a session running the new one. v2 subtracts
+# the local continuum before dividing by the noise.
+_SNR_FORMULA_VERSION = 2
+
+
+def _flank_continuum(cont):
+    """Continuum level and noise per spaxel, from the two flanks of a line.
+
+    Returns `(level, noise)`, both (nx, ny). The flanks are not reliably
+    line-free — at z≈0.04 both [N II] lines sit inside Hα's default flanks — so
+    the level is taken after clipping emission away: two asymmetric passes drop
+    channels more than 3σ *above* the running median, which removes line cores
+    while leaving the noise distribution, and any absorption, untouched. A plain
+    median would be biased upward by exactly the lines whose S/N we are trying
+    to measure, and that bias is then subtracted straight off the line.
+    """
+    level = np.median(cont, axis=0)
+    noise = 1.4826 * np.median(np.abs(cont - level), axis=0)
+    for _ in range(2):
+        scale = np.isfinite(noise) & (noise > 0) & np.isfinite(level)
+        # Where there is no usable scale, clip nothing rather than everything.
+        hi = np.where(scale, level + 3.0 * noise, np.inf)
+        kept = np.where(cont <= hi, cont, np.nan)
+        with warnings.catch_warnings():
+            # A spaxel that is NaN throughout has no continuum to report; the
+            # NaN it yields is the answer, and `usable` drops it downstream.
+            warnings.simplefilter('ignore', RuntimeWarning)
+            level = np.nanmedian(kept, axis=0)
+            noise = 1.4826 * np.nanmedian(np.abs(kept - level), axis=0)
+    return level, noise
+
+
+def compute_snr_map(data, wavelengths, centroids, search_window_width,
+                    continuum_offset, continuum_width):
+    """Per spaxel, the best S/N over the given line centres.
+
+    S/N per line = (95th-percentile flux in a window around the line centre,
+    **minus the local continuum**) / (MAD-based noise in the two continuum
+    flanks). The subtraction is what makes this a line measurement rather than
+    a brightness measurement: without it the ratio is (continuum + line)/noise,
+    so a bright continuum source with no emission at all passes any threshold —
+    a foreground star in UGC 05101 scored 43 on a spectrum with no Ha in it.
+
+    Every mask depends only on `wavelengths` and the line centre — not on the
+    spaxel — so each line is one pass of whole-array operations rather than
+    nx*ny Python iterations.
+
+    Free function so the GUI and the headless runner cannot drift apart on the
+    definition of S/N, the way the parameter builders did.
+    """
+    wavelengths = np.asarray(wavelengths, dtype=float)
+    _, nx, ny = np.shape(data)
+    per_line = []
+    for line_center in centroids:
+        try:
+            line_center = float(line_center)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(line_center):
+            continue
+
+        line_mask = ((wavelengths >= line_center - search_window_width / 2) &
+                     (wavelengths <= line_center + search_window_width / 2))
+        # Both flanks in one mask: the noise is a median, which does not care
+        # about the order the two sides are concatenated in.
+        cont_mask = (((wavelengths >= line_center - continuum_offset - continuum_width) &
+                      (wavelengths <= line_center - continuum_offset)) |
+                     ((wavelengths <= line_center + continuum_offset + continuum_width) &
+                      (wavelengths >= line_center + continuum_offset)))
+
+        peak_flux = (np.percentile(data[line_mask], 95, axis=0)
+                     if line_mask.any() else np.zeros((nx, ny)))
+        if cont_mask.sum() > 1:
+            level, noise = _flank_continuum(
+                np.asarray(data[cont_mask], dtype=np.float64))
+        else:
+            level = np.zeros((nx, ny))
+            noise = np.full((nx, ny), np.nan)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            usable = np.isfinite(noise) & (noise > 0) & np.isfinite(level)
+            # The line above its own continuum — not the total flux there.
+            amplitude = peak_flux - level
+            per_line.append(np.where(usable,
+                                     amplitude / np.where(usable, noise, 1.0), 0.0))
+
+    if not per_line:
+        return np.zeros((nx, ny))
+    with warnings.catch_warnings():
+        # A spaxel that is NaN in every line's window has no S/N to report;
+        # nanmax says so with a warning and a NaN, which is the answer.
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmax(np.stack(per_line, axis=0), axis=0)
+
 
 def invalidate_snr_cache(reason=''):
     """Drop the cached S/N map. Call from anywhere the cube, its wavelength
@@ -155,6 +253,34 @@ def invalidate_snr_cache(reason=''):
 data_observation_init = {'sourcename': [''],
                     'redshift': [''],
                     'resolvingpower': ['']}
+
+# Where the current resolving power came from — shown in the R button's
+# tooltip, so a value HyperCube derived is never mistaken for one the user
+# entered. Empty when R was typed by hand or never established.
+R_PROVENANCE = ''
+
+# Set once we have warned that pPXF is guessing at R, so the warning appears
+# once per cube rather than once per spaxel.
+_R_FALLBACK_WARNED = False
+
+
+def resolving_power_for_templates(default=3000.0):
+    """R to convolve the stellar templates with, announcing any guess.
+
+    R sets the instrumental width pPXF removes from sigma_*, so falling back to
+    a default silently turns an unknown into an unmarked assumption.
+    """
+    global _R_FALLBACK_WARNED
+    R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
+    if np.isfinite(R) and R > 0:
+        return float(R)
+    if not _R_FALLBACK_WARNED:
+        _R_FALLBACK_WARNED = True
+        print(f'pPXF: no resolving power set for this cube — assuming R = '
+              f'{default:g} to convolve the templates. R sets the instrumental '
+              f'width removed from sigma_*, so set it with the "R:" button if '
+              f'{default:g} is wrong here.')
+    return float(default)
 
 df_obs = pd.DataFrame(data_observation_init)
 
@@ -200,6 +326,7 @@ data_lines_init = {'Line_ID': [],
         'Sigma_0_highlim': [],
         'Constraints': np.array(5),
         'kgroup': [],
+        'kgroup_ref': [],
         'Amp_fit': [],
         'Centroid_fit': [],
         'Sigma_fit': [],
@@ -1615,6 +1742,201 @@ def _extension_kind(header, data):
     return None
 
 
+# ── Resolving power from the instrument's own headers ────────────────────────
+#
+# R is not a free parameter: it convolves the stellar templates to the
+# instrument's line-spread function before pPXF fits a LOSVD, so an R that is
+# wrong by a factor of two biases sigma_*. Almost no IFU cube states R outright,
+# but every one of them states the configuration that determines it — grating,
+# slicer, channel/band — so R is recovered from those. Everything derived here
+# is a *nominal* instrument value, announced on the console and attributed in
+# the R button's tooltip, and the user can always type over it.
+
+# The instrument resolution tables and the LSF curves themselves live in
+# HyperCube_LSF, which is Qt-free so the batch runner and the template layer can
+# share them. These names stay as aliases: the resolving-power tiers below read
+# them exactly as before, and there is still only one definition of each.
+_KCWI_FWHM_LARGE    = HyperCube_LSF.KCWI_FWHM_LARGE
+_KCWI_ANCHORED      = HyperCube_LSF.KCWI_ANCHORED
+_KCWI_SLICER_GAIN   = HyperCube_LSF.KCWI_SLICER_GAIN
+_KCWI_SLICER_LETTER = HyperCube_LSF.KCWI_SLICER_LETTER
+_MIRI_MRS_R         = HyperCube_LSF.MIRI_MRS_R
+_NIRSPEC_R          = HyperCube_LSF.NIRSPEC_R
+_kcwi_grating_fwhm  = HyperCube_LSF.kcwi_grating_fwhm
+
+
+def _kcwi_supercube_gratings(header):
+    """Gratings a coadded KCWI supercube was built from, per its HISTORY.
+
+    A supercube keeps none of the instrument keywords, but the combine step
+    records what went into it ("Supercube created by combining: RH2, RH1, BH1,
+    BLL"). That does not yield one R — the pieces have different resolutions —
+    but it does say exactly which, which is what the user needs to choose.
+    """
+    try:
+        history = [str(h) for h in header['HISTORY']]
+    except (KeyError, TypeError):
+        return []
+    for line in history:
+        if 'combining' not in line.lower():
+            continue
+        tokens = line.split(':', 1)[-1].replace(' and ', ',').split(',')
+        found = []
+        for t in tokens:
+            hit = _kcwi_grating_fwhm(t)
+            if hit and hit[0] not in [f[0] for f in found]:
+                found.append(hit)
+        if found:
+            return found
+    return []
+
+
+def _muse_resolving_power(lam, model=HyperCube_LSF.MUSE_LSF_DEFAULT):
+    """VLT/MUSE R at `lam` (Å) under the named LSF parameterisation.
+
+    See HyperCube_LSF.MUSE_LSF_MODELS: the measured and the nominal curves
+    disagree by ~9% at 4800 Å and cross near 6000 Å, so which one is in use is
+    recorded in the provenance string rather than assumed.
+    """
+    R = HyperCube_LSF.muse_lsf(model).R(lam)
+    return float(R) if np.isfinite(R) and R > 0 else None
+
+
+def _header_str(header, key):
+    """A header value as a stripped upper-case string, or '' if absent."""
+    v = header.get(key)
+    return str(v).strip().upper() if v is not None else ''
+
+
+def resolving_power_from_header(header, wl=None):
+    """Nominal resolving power for the configuration this header describes.
+
+    Returns `(R, provenance)`, or `(None, reason)` when nothing in the header
+    determines it. `wl` is the cube's wavelength axis, used to evaluate a
+    wavelength-dependent R at mid-coverage and to tell a KCWI blue cube from a
+    red one. Three tiers are tried in order: a keyword stating R outright, a
+    keyword stating the resolution element, and the named instrument.
+    """
+    lam_mid = None
+    if wl is not None and len(np.atleast_1d(wl)):
+        w = np.asarray(wl, dtype=float)
+        w = w[np.isfinite(w)]
+        if w.size:
+            lam_mid = float(np.median(w))
+
+    # ── Tier 1: the header states R (or a resolution element) directly ──
+    for key in ('RESOLVINGP', 'RESOLVING_POWER', 'SPECRES', 'RESOLUTIO',
+                'RESOLUTION', 'R'):
+        v = _safe_float(header.get(key))
+        if not np.isfinite(v) or v <= 0:
+            continue
+        # SPECRES/RESOLUTION are written both ways round. A resolving power is
+        # a large dimensionless number; a resolution element is a small width
+        # in the spectral unit, so the magnitude disambiguates them.
+        if v > 50:
+            return v, f'header {key} = {v:g}'
+        if lam_mid:
+            return lam_mid / v, (f'header {key} = {v:g} read as a resolution '
+                                 f'element at {lam_mid:.0f}')
+
+    for key in ('RESOLWAV', 'FWHMSPEC', 'LSFWID'):
+        v = _safe_float(header.get(key))
+        if np.isfinite(v) and v > 0 and lam_mid:
+            return lam_mid / v, f'header {key} = {v:g} (resolution element)'
+
+    # ── Tier 2: the named instrument configuration ──
+    instrument = _header_str(header, 'INSTRUME')
+
+    if 'KCWI' in instrument or 'KCRM' in instrument:
+        slicer = _header_str(header, 'IFUNAM') or 'LARGE'
+        gain = _KCWI_SLICER_GAIN.get(slicer)
+        # Which arm does this cube come from? Compare its coverage against the
+        # two arms' central wavelengths rather than trusting that only one
+        # grating is named -- a KCWI header names both, whichever arm it holds.
+        blue, red = _safe_float(header.get('BCWAVE')), _safe_float(header.get('RCWAVE'))
+        arm = None
+        if lam_mid and np.isfinite(blue) and np.isfinite(red):
+            arm = 'B' if abs(lam_mid - blue) <= abs(lam_mid - red) else 'R'
+            if wl is not None and len(np.atleast_1d(wl)) > 1:
+                w = np.asarray(wl, dtype=float)
+                lo, hi = np.nanmin(w), np.nanmax(w)
+                if lo < blue < hi and lo < red < hi:
+                    print('Resolving power: this cube spans both KCWI arms — R '
+                          'differs between them; using the arm nearest mid-coverage.')
+        elif np.isfinite(blue):
+            arm = 'B'
+        elif np.isfinite(red):
+            arm = 'R'
+        # A KCWI header names BOTH gratings whichever arm the cube holds, so the
+        # arm decided above is what picks the right one.
+        grating = _header_str(header, 'BGRATNAM' if arm == 'B' else 'RGRATNAM')
+        if not grating:
+            grating = (_header_str(header, 'BGRATNAM')
+                       or _header_str(header, 'RGRATNAM')
+                       or _header_str(header, 'GRATNAM'))
+        fwhm = _KCWI_FWHM_LARGE.get(grating)
+        if fwhm and lam_mid:
+            if not gain:
+                gain, slicer = 1.0, 'LARGE (assumed)'
+            R = lam_mid / (fwhm / gain)
+            note = (f'{instrument} {grating} grating, {slicer.title()} slicer '
+                    f'— {fwhm / gain:.2f} Å FWHM at {lam_mid:.0f} Å')
+            if grating not in _KCWI_ANCHORED:
+                note += ' (nominal, unconfirmed for this grating)'
+            return R, note
+        if not grating:
+            # Coadds and supercubes drop the instrument keywords, but the
+            # combine step records its ingredients. Those have different
+            # resolutions, so report them rather than average them into a
+            # single number that would be wrong everywhere.
+            parts = _kcwi_supercube_gratings(header)
+            if parts and lam_mid:
+                shown = []
+                for nm, fwhm_large, letter in parts:
+                    # A token may name its own slicer ('BLL'); otherwise fall
+                    # back to the header's, or Large. Quote the resolution
+                    # element, not an R: R = lambda/FWHM, and each grating
+                    # covers only its own part of the band, so an R quoted at
+                    # the supercube's midpoint would be for a wavelength most
+                    # of these gratings never saw.
+                    g = _KCWI_SLICER_GAIN.get(_KCWI_SLICER_LETTER.get(letter),
+                                              gain or 1.0)
+                    shown.append(f'{nm} {fwhm_large / g:.2f} Å')
+                detail = ', '.join(shown)
+                print(f'Resolving power: this is a coadded supercube of '
+                      f'{len(parts)} gratings with different resolutions '
+                      f'({detail} FWHM). No single R describes it — set R = '
+                      f'λ/FWHM for the grating covering the line you fit '
+                      f'(e.g. {parts[0][1]:.2f} Å → R ≈ '
+                      f'{6800 / parts[0][1]:.0f} at 6800 Å).')
+                return None, (f'{instrument} supercube combining '
+                              f'{", ".join(nm for nm, _, _ in parts)}')
+            return None, (f'{instrument} cube carries no grating keywords '
+                          f'(BGRATNAM/RGRATNAM) — and a cube spanning both arms '
+                          f'has no single R in any case')
+
+    if 'MIRI' in instrument:
+        key = (_header_str(header, 'CHANNEL'), _header_str(header, 'BAND'))
+        R = _MIRI_MRS_R.get(key)
+        if R:
+            return R, f'MIRI MRS channel {key[0]} band {key[1]} (band-averaged)'
+
+    if 'NIRSPEC' in instrument:
+        disperser = _header_str(header, 'GRATING') or _header_str(header, 'DISPERSER')
+        R = _NIRSPEC_R.get(disperser)
+        if R:
+            return R, f'NIRSpec {disperser}'
+
+    if 'MUSE' in instrument and lam_mid:
+        R = _muse_resolving_power(lam_mid)
+        if R:
+            return R, (f'{HyperCube_LSF.muse_lsf().label} '
+                       f'evaluated at {lam_mid:.0f} A')
+
+    return None, (f'no resolving power in the header for instrument '
+                  f'{instrument or "(unnamed)"}')
+
+
 def loadable_extensions(hdul):
     """List the HDUs of an open HDUList that HyperCube knows how to ingest.
 
@@ -1930,8 +2252,24 @@ class ViewerWindow(QMainWindow):
 
         img_bar.addWidget(_vsep())
 
+        # S/N mask contour toggle. Checkable, because it is a display state
+        # that persists across redraws rather than a one-shot draw.
+        self.snr_contour_toggle = QPushButton('S/N mask', self)
+        self.snr_contour_toggle.setCheckable(True)
+        self.snr_contour_toggle.setFixedHeight(ui_px(24))
+        self.snr_contour_toggle.setToolTip(
+            'Show the S/N mask as a red contour at the current threshold.\n'
+            'Stays on through colormap, stretch, rotation, mask and map changes.')
+        self.snr_contour_toggle.toggled.connect(self.set_snr_contour_visible)
+        img_bar.addWidget(self.snr_contour_toggle)
+
+        img_bar.addWidget(_vsep())
+
         # Rotate / flip buttons — formerly the floating side panel
         self._cube_rotation = 0
+        # S/N mask contour: a display preference that outlives any redraw.
+        self._show_snr_contour = False
+        self._snr_contour = None
         self._cube_flip_h = False
         self._cube_flip_v = False
         self._cube_coords_mode = "xy"
@@ -2103,6 +2441,24 @@ class ViewerWindow(QMainWindow):
             lbl.setStyleSheet("color: #ccc; padding: 0 8px;")
             self.status_bar.addPermanentWidget(lbl)
 
+        # Load progress. Reading a cube takes long enough to look like a hang,
+        # so it reports itself where the filename will end up: the bar is
+        # inserted before `_sb_file` and that label is hidden while it runs, so
+        # the bar occupies the label's place instead of shifting the row.
+        self._sb_load = QProgressBar()
+        self._sb_load.setRange(0, 100)
+        self._sb_load.setTextVisible(True)
+        self._sb_load.setFormat('Loading file %p%')
+        self._sb_load.setFixedWidth(ui_px(190))
+        self._sb_load.setFixedHeight(ui_px(16))
+        self._sb_load.setStyleSheet(
+            "QProgressBar { border: 1px solid #555; border-radius: 3px;"
+            f" background: #1e1e1e; color: #eee; text-align: center; {ui_font_css('small')} }}"
+            "QProgressBar::chunk { background-color: #3fbf5f; border-radius: 2px; }")
+        self._sb_load.hide()
+        self.status_bar.insertPermanentWidget(0, self._sb_load)
+        self._loading_file = False
+
         # Set up central widget
         central_widget = QWidget()
         central_widget.setLayout(main_layout)
@@ -2133,6 +2489,16 @@ class ViewerWindow(QMainWindow):
         self._cube_pan_start_ylim = None
 
         self.cursor_pos = None
+
+        # Drop a FITS file anywhere on the window to load it. Qt propagates a
+        # drag up to the first ancestor that accepts drops, so the window sees
+        # drops over the canvases and toolbars for free -- but a QLineEdit
+        # accepts drops itself and would paste the path instead. Nothing in
+        # this window wants a text drop, so the whole tree defers to us.
+        self.setAcceptDrops(True)
+        for _w in self.findChildren(QtWidgets.QWidget):
+            if _w.acceptDrops():
+                _w.setAcceptDrops(False)
 
     # ── Cube viewport zoom ────────────────────────────────────────────────────
 
@@ -2248,9 +2614,9 @@ class ViewerWindow(QMainWindow):
             span = 1.0
 
         # Sensitivity: 300 px of drag = 1 full span shift/scale
-        # Up/down = brightness (shift midpoint); left/right = contrast (scale span)
-        brightness_shift = (dy / 300.0) * span   # up = brighter
-        contrast_scale   = 10 ** (dx / 300.0)    # right = wider range (less contrast)
+        # Left/right = brightness (shift midpoint); up/down = contrast (scale span)
+        brightness_shift = (dx / 300.0) * span   # right = brighter
+        contrast_scale   = 10 ** (dy / 300.0)    # up = wider range (less contrast)
 
         mid = (self._bc_vmin0 + self._bc_vmax0) / 2 + brightness_shift
         half = (span / 2) * contrast_scale
@@ -2525,6 +2891,80 @@ class ViewerWindow(QMainWindow):
         if getattr(self, '_cube_flip_v', False):
             img = np.flipud(img)
         return img
+
+    def _snr_contour_clear(self):
+        """Drop the S/N contour artists, if any are still on the axes."""
+        cs = getattr(self, '_snr_contour', None)
+        if cs is None:
+            return
+        try:
+            cs.remove()
+        except Exception:
+            # Older matplotlib exposes the line collections instead.
+            for coll in getattr(cs, 'collections', []):
+                try:
+                    coll.remove()
+                except Exception:
+                    pass
+        self._snr_contour = None
+
+    def draw_snr_contour(self, redraw=True):
+        """(Re)draw the red S/N-mask contour if it is switched on.
+
+        Called from `draw_image`'s overlay-restore block, so the contour
+        survives everything that rebuilds the figure — a colormap or stretch
+        change, a rotation, a spatial mask, a parameter map, a Rectify pass.
+        Before this it was drawn once by "Calculate S/N map" and silently lost
+        on the next redraw, which is the same latent bug the selection box had.
+
+        The contour is drawn in display coordinates, so the map is put through
+        the same rotate/flip as the image; otherwise it would sit at the
+        original orientation over a transformed field.
+        """
+        self._snr_contour_clear()
+        if not getattr(self, '_show_snr_contour', False):
+            if redraw:
+                self.canvas.draw_idle()
+            return
+        smap = globals().get('snr_map', None)
+        if smap is None or not np.ndim(smap) == 2 or not np.isfinite(smap).any():
+            if redraw:
+                self.canvas.draw_idle()
+            return
+        level = _safe_float(globals().get('snr_value', 0))
+        if not np.isfinite(level):
+            return
+
+        img = np.asarray(smap, dtype=float)
+        k = getattr(self, '_cube_rotation', 0) % 4
+        if k:
+            img = np.rot90(img, k=k)
+        if getattr(self, '_cube_flip_h', False):
+            img = np.fliplr(img)
+        if getattr(self, '_cube_flip_v', False):
+            img = np.flipud(img)
+        if getattr(self, 'ax', None) is None:
+            return
+        try:
+            with warnings.catch_warnings():
+                # An all-one-side map has no contour to draw; that is an answer,
+                # not a problem.
+                warnings.simplefilter('ignore')
+                self._snr_contour = self.ax.contour(
+                    img, levels=[level], colors='red', linewidths=1.5)
+        except Exception as e:
+            print(f'S/N contour could not be drawn: {type(e).__name__}: {e}')
+            self._snr_contour = None
+        if redraw:
+            self.canvas.draw_idle()
+
+    def set_snr_contour_visible(self, on):
+        """Turn the S/N contour on or off and remember the choice."""
+        self._show_snr_contour = bool(on)
+        if getattr(self, 'snr_contour_toggle', None) is not None:
+            b = self.snr_contour_toggle
+            b.blockSignals(True); b.setChecked(self._show_snr_contour); b.blockSignals(False)
+        self.draw_snr_contour()
 
     def _cube_transform_coords(self, xd, yd):
         """Map display coords (after rotate/flip) back to original data coords.
@@ -3637,7 +4077,117 @@ class ViewerWindow(QMainWindow):
         if file_path:
             self._load_fits_from_path(file_path)
 
+    # ── Load progress ─────────────────────────────────────────────────────────
+
+    def _load_progress_begin(self, file_path, what='file'):
+        """Hand the filename label's slot over to the progress bar.
+
+        `what` names the thing being loaded ('file', 'template'), so the bar
+        reads correctly for the other long operations that borrow it.
+        """
+        self._loading_file = True
+        self._sb_file.hide()
+        self._sb_load.setValue(0)
+        self._sb_load.setFormat(f'Loading {what} %p%')
+        self._sb_load.show()
+        self._load_progress(0, f'Loading {os.path.basename(file_path)}…')
+
+    def _load_progress(self, pct, note=None):
+        """Move the bar to `pct` and repaint it.
+
+        The loader runs on the GUI thread, so nothing redraws unless we pump the
+        event loop by hand. User input is excluded from that pump deliberately:
+        it keeps a second Open — or a second drop — from re-entering the loader
+        while this one is part-way through rewriting the module globals.
+        """
+        bar = getattr(self, '_sb_load', None)
+        if bar is None or not self._loading_file:
+            return
+        bar.setValue(int(min(100, max(0, pct))))
+        if note:
+            self.status_bar.showMessage(note)
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+    def _load_progress_end(self):
+        """Put the filename label back, however the load ended."""
+        self._loading_file = False
+        bar = getattr(self, '_sb_load', None)
+        if bar is not None:
+            bar.hide()
+            bar.setValue(0)
+        self.status_bar.clearMessage()
+        self._sb_file.setText(
+            os.path.basename(getattr(self, 'fits_path', '') or '') or 'No file loaded')
+        self._sb_file.show()
+
+    # ── Drag and drop a FITS file onto the window ─────────────────────────────
+
+    #: Suffixes we will open on a drop. `.fz` is Rice-tile-compressed FITS.
+    _FITS_DROP_SUFFIXES = ('.fits', '.fit', '.fts',
+                           '.fits.gz', '.fit.gz', '.fts.gz',
+                           '.fits.fz', '.fits.bz2')
+
+    @classmethod
+    def _fits_path_from_mime(cls, mime):
+        """The first local FITS file in a drag, or None if it carries none."""
+        if mime is None or not mime.hasUrls():
+            return None
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if path.lower().endswith(cls._FITS_DROP_SUFFIXES) and os.path.isfile(path):
+                return path
+        return None
+
+    def dragEnterEvent(self, event):
+        path = self._fits_path_from_mime(event.mimeData())
+        if path is None or self._loading_file:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.status_bar.showMessage(f'Drop to load {os.path.basename(path)}')
+
+    def dragMoveEvent(self, event):
+        if self._loading_file or self._fits_path_from_mime(event.mimeData()) is None:
+            event.ignore()
+        else:
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self.status_bar.clearMessage()
+        event.accept()
+
+    def dropEvent(self, event):
+        path = self._fits_path_from_mime(event.mimeData())
+        if path is None or self._loading_file:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.status_bar.clearMessage()
+        # Let the drag finish and the source application release the drop before
+        # the loader takes the GUI thread for the length of a cube read.
+        QTimer.singleShot(0, lambda p=path: self._load_fits_from_path(p))
+
     def _load_fits_from_path(self, file_path, for_session=False, force_ext=None):
+        """Load a FITS file, reporting progress in the status bar.
+
+        The work itself is `_load_fits_from_path_impl`; this wrapper owns only
+        the progress bar, so every way out of the loader — including the early
+        returns for a cancelled extension picker or a binary table — restores
+        the filename label.
+        """
+        if self._loading_file:
+            print('A file is already loading — ignoring this request.')
+            return
+        self._load_progress_begin(file_path)
+        try:
+            return self._load_fits_from_path_impl(
+                file_path, for_session=for_session, force_ext=force_ext)
+        finally:
+            self._load_progress_end()
+
+    def _load_fits_from_path_impl(self, file_path, for_session=False, force_ext=None):
         """Load a FITS file from a path (shared by the Open dialog and session
         restore). When for_session=True, the observation-info extraction and
         the source-resolve popup are skipped because the caller restores
@@ -3647,11 +4197,13 @@ class ViewerWindow(QMainWindow):
         global FITS_HEADER, FITS_DATA, wavelengths, snr_map, spectrum
         if file_path:
             invalidate_snr_cache()
+            self._load_progress(3, 'Opening file…')
             with fits.open(file_path) as hdul:
                 # Which extension holds the data? Files routinely carry several
                 # (JWST s3d: SCI/ERR/DQ; KCWI supercubes; …), so when more than
                 # one is loadable the user picks instead of us guessing.
                 cands = loadable_extensions(hdul)
+                self._load_progress(10, 'Scanning extensions…')
                 chosen = None
                 if force_ext is not None:
                     chosen = next((c for c in cands if c['ext'] == int(force_ext)), None)
@@ -3668,6 +4220,7 @@ class ViewerWindow(QMainWindow):
                     else:
                         chosen = default
 
+                self._load_progress(18, 'Reading data…')
                 self.fits_path = file_path
                 self.fits_ext = 0
                 self.fits_header = None
@@ -3688,10 +4241,12 @@ class ViewerWindow(QMainWindow):
                     # table's own columns.
                     header = hdul[ext].header
                     if ext != 0 and chosen['kind'] != 'bintable':
+                        self._load_progress(28, 'Merging the primary header…')
                         header = _inherit_primary_cards(header, hdul[0].header)
                     self.fits_header = header
                     self.fits_data = data
                     self.fits_ext = ext
+                    self._load_progress(40)
                     print(f"Loading extension {ext} ({chosen['name']}): "
                           f"{_extension_type_label(chosen)} {chosen['shape']}")
 
@@ -3742,6 +4297,7 @@ class ViewerWindow(QMainWindow):
                     return
                     
                 elif self.is_1d_spectrum:
+                    self._load_progress(55, 'Preparing the spectrum…')
                     print("1D spectrum detected")
                     if not self.has_explicit_wavelengths:
                         print("Warning: No wavelength info found - using pixel indices")
@@ -3751,7 +4307,9 @@ class ViewerWindow(QMainWindow):
                 elif self.is_3d_cube:
                     print(f"{FITS_DATA.ndim}D cube detected")
                     if FITS_DATA.ndim == 3:  # (nchan, ny, nx)
+                        self._load_progress(55, 'Collapsing the cube…')
                         self.process_3d_cube()
+                        self._load_progress(80)
                         # For 3D cubes, create field selection dialog
                     #     self.column_names = ['Flux']  # Default name
                     #     self.show_column_selection_dialog()
@@ -3761,7 +4319,9 @@ class ViewerWindow(QMainWindow):
                 # Measurement errors: look for a variance / error / inverse-
                 # variance cube for this file. Silent — it prints what it found
                 # and falls back to the empirical estimator, never blocks ingest.
+                self._load_progress(85, 'Looking for measurement errors…')
                 self.detect_measurement_errors()
+                self._load_progress(93, 'Reading observation info…')
 
                 # Extract observation info (skipped on session restore — the
                 # session supplies df_obs and we don't want the NED popup).
@@ -3772,6 +4332,7 @@ class ViewerWindow(QMainWindow):
                         self.bkg_image_btn.setEnabled(True)
                 else:
                     self.extract_observation_info()
+                self._load_progress(100)
 
     def _choose_fits_extension(self, file_path, cands, default):
         """Ask which extension of a multi-extension file to load.
@@ -3958,6 +4519,8 @@ class ViewerWindow(QMainWindow):
             'fit_results':       fit_results,
             'snr_map':           snr_map,
             'snr_value':         snr_value,
+            'snr_formula':       _SNR_FORMULA_VERSION,
+            'show_snr_contour':  bool(getattr(self, '_show_snr_contour', False)),
             'wavelengths':       wavelengths,
             'current_spaxel':    getattr(self, 'current_spaxel', None),
             'init_guess_spaxel': getattr(self, '_init_guess_spaxel', None),
@@ -4045,8 +4608,23 @@ class ViewerWindow(QMainWindow):
         df_fit      = session.get('df_fit', df_fit)
         fit_results = session.get('fit_results', fit_results)
         if session.get('snr_map') is not None:
-            snr_map = session['snr_map']
+            # A map written under an older S/N definition would silently gate
+            # the fit by numbers this build no longer produces. Drop it and let
+            # the next S/N pass rebuild it rather than restore it.
+            if session.get('snr_formula', 1) == _SNR_FORMULA_VERSION:
+                snr_map = session['snr_map']
+            else:
+                # Leave the open-gate map the cube load just installed rather
+                # than clearing it: `snr_map` is indexed unguarded by the fit
+                # loops, so None would crash them.
+                print('Session S/N map was built by an older definition of S/N '
+                      '(no continuum subtraction) — discarding it; recompute the '
+                      'S/N map to re-apply a mask.')
+                invalidate_snr_cache()
         snr_value   = session.get('snr_value', snr_value)
+        # Restore the contour preference *and* the toggle's own state, so the
+        # button does not disagree with what is on the image.
+        self.set_snr_contour_visible(bool(session.get('show_snr_contour', False)))
         if session.get('wavelengths') is not None:
             wavelengths = session['wavelengths']
         if session.get('current_spaxel') is not None:
@@ -4375,9 +4953,13 @@ class ViewerWindow(QMainWindow):
         global wavelengths, snr_map
 
         self._spaxel_mask = None  # drop any mask from a previously-loaded cube
+        # Collapsing every channel into the white-light image is the long pole
+        # of a cube load, so the bar is stepped across it rather than around it.
         self.draw_image(FITS_DATA, cmap='gray', scale='linear', from_fits=True)
+        self._load_progress(72, 'Reading the WCS…')
         self.wcs = WCS(self.fits_header)
-        
+        self._load_progress(78, 'Building the spectral axis…')
+
         # Initialize SNR map
         _, nx, ny = FITS_DATA.shape
         snr_map = np.zeros((nx, ny)) + 1E8
@@ -4412,10 +4994,24 @@ class ViewerWindow(QMainWindow):
             return ''
 
         source_redshift = _first_hdr(['REDSHIFT', 'Z', 'ZSYS', 'REDSHIFT0'])
-        # Resolving power may be stored directly (R/RESOLVINGP/SPECRES) or derived
-        # from a resolution element (FWHM in Å via RESOLWAV/CDELT) — try direct keys.
-        resolving_power = _first_hdr(['RESOLVINGP', 'R', 'SPECRES', 'RESOLUTIO',
-                                      'RESOLUTION', 'RESOLVING_POWER'])
+
+        # Resolving power: stated outright by almost no IFU cube, but implied by
+        # the configuration every one of them records (grating + slicer, or
+        # channel + band). Derived rather than left blank, because the pPXF path
+        # silently falls back to R = 3000 and that biases sigma_*.
+        global R_PROVENANCE, _R_FALLBACK_WARNED
+        _R_FALLBACK_WARNED = False
+        R_value, R_note = resolving_power_from_header(FITS_HEADER, wavelengths)
+        if R_value:
+            resolving_power = int(round(R_value))
+            R_PROVENANCE = R_note
+            print(f'Resolving power: R ≈ {resolving_power} — {R_note}. '
+                  f'Nominal for the configuration; edit the R button to override.')
+        else:
+            resolving_power = ''
+            R_PROVENANCE = ''
+            print(f'Resolving power: {R_note} — leaving it blank. '
+                  f'Set it with the R button (pPXF assumes 3000 without it).')
 
         df_obs.loc[0] = [source_name, source_redshift, resolving_power]
         print("FITS file loaded successfully!")
@@ -4571,6 +5167,37 @@ class ViewerWindow(QMainWindow):
 
 
     
+    def _map_readout(self, x=None, y=None):
+        """The overlay's value line: `z: <value under the cursor>`.
+
+        Deliberately just "z" — the colorbar already carries the field's name
+        and units, and repeating them here cost several characters of overlay
+        for every map. Returns '' when no map is displayed, otherwise a string
+        ending in a newline so callers can concatenate the coordinate block.
+
+        Shown as `z: —` before the cursor is over a spaxel so the overlay does
+        not change height as the pointer moves.
+        """
+        if not getattr(self, '_cbar_label', None):
+            return ''
+        vals = getattr(self, '_display_values', None)
+        if (x is not None and y is not None and vals is not None
+                and getattr(vals, 'ndim', 0) == 2
+                and 0 <= y < vals.shape[0] and 0 <= x < vals.shape[1]):
+            v = vals[y, x]
+            return f"z: {_fmt(v)}\n" if np.isfinite(v) else "z: —\n"
+        return "z: —\n"
+
+    def refresh_map_readout(self):
+        """Put the z line back in the overlay without waiting for a mouse move."""
+        if getattr(self, 'spaxel_info_text', None) is None:
+            return
+        try:
+            self.spaxel_info_text.set_text(self._map_readout().rstrip('\n'))
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
     def update_spaxel_overlay(self, x, y):
         """Update the RA/Dec/X/Y/N text overlay on the cube image and the
         status bar. Always called on mouse move."""
@@ -4581,23 +5208,11 @@ class ViewerWindow(QMainWindow):
         dec_sexagesimal = self.decimal_to_sexagesimal(dec[0], is_ra=False)
         n = self.get_spaxel_number(x, y)
         if hasattr(self, 'spaxel_info_text'):
-            qual_label = getattr(self, '_quality_map_label', None)
-            if qual_label is not None:
-                try:
-                    img = self._last_data
-                    val = float(img[y, x]) if (img is not None and
-                          hasattr(img, 'ndim') and img.ndim == 2 and
-                          0 <= y < img.shape[0] and 0 <= x < img.shape[1]) else None
-                    val_str = f"\n{qual_label}: {val:.3g}" if (val is not None and np.isfinite(val)) else ""
-                except Exception:
-                    val_str = ""
-            else:
-                val_str = ""
             self.spaxel_info_text.set_text(
+                f"{self._map_readout(x, y)}"
                 f"RA  {ra_sexagesimal}\n"
                 f"Dec {dec_sexagesimal}\n"
                 f"X {x}   Y {y}   N {n}"
-                f"{val_str}"
             )
             self.canvas.draw_idle()
         # Status bar
@@ -5996,8 +6611,7 @@ class ViewerWindow(QMainWindow):
             moments = int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2
             z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
             z = 0.0 if not np.isfinite(z) else z
-            R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
-            R = 3000.0 if not np.isfinite(R) or R <= 0 else R
+            R = resolving_power_for_templates()
             spectrum = np.nan_to_num(self.get_spectrum_at_spaxel(int(x), int(y)))
             velscale, lam_rest = hcppxf.galaxy_velscale(wavelengths, z, fit_range)
             lib = _STELLAR_LIBS.get(library) or hcppxf.TemplateLibrary(library).load()
@@ -6259,19 +6873,30 @@ class ViewerWindow(QMainWindow):
         """Generates and displays the white-light image in the left panel."""
         self._last_cmap  = cmap
         self._last_scale = scale
-        self._last_from_fits = from_fits
         if from_fits:
             self._quality_map_label = None
         # Only update _last_data when called from a real data load (not from
         # _cube_redraw_transformed, which passes already-transformed 2D data).
         # _cube_redraw_transformed sets _applying_transform=True before calling.
+        #
+        # `_last_from_fits` describes `_last_data`, so it moves with it. Updating
+        # it unconditionally left the flag saying "2D" while the cached array was
+        # still the 3D cube, and the next transform fed that cube straight to
+        # imshow: rotating and then flipping raised "Invalid shape (nchan, ny,
+        # nx) for image data". Any two consecutive viewport transforms did it.
         if not getattr(self, '_applying_transform', False):
             self._last_data = data
+            self._last_from_fits = from_fits
             # Cache the original 2D shape for coord inverse transform
             if from_fits and hasattr(data, 'ndim') and data.ndim == 3:
                 self._cube_orig_shape = (data.shape[1], data.shape[2])  # (ny, nx)
             elif not from_fits and hasattr(data, 'ndim') and data.ndim == 2:
                 self._cube_orig_shape = data.shape
+        # Drawing the cube itself (white-light image) means no fit map is on
+        # screen any more, so there is nothing for a later fit to re-render.
+        if from_fits:
+            self._map_refresher = None
+            self._cbar_label = f'flux [{flux_unit_str()}]'
         global npix_x, npix_y
         if from_fits:
             image = np.nansum(data, axis=0).astype(np.float64)
@@ -6288,6 +6913,14 @@ class ViewerWindow(QMainWindow):
         if _smask is not None and hasattr(image, 'shape') \
                 and image.ndim == 2 and _smask.shape == image.shape:
             image = np.where(_smask, np.nan, image)
+
+        # The values the user is actually looking at, before the transfer
+        # function and clipping distort them. The cursor readout must quote
+        # these — a log-stretched or clipped number is not the measurement.
+        try:
+            self._display_values = np.array(image, dtype=np.float64, copy=True)
+        except Exception:
+            self._display_values = None
 
         # ── Apply transfer function (scale) ───────────────────────────
         # Prefer toolbar setting; fall back to passed-in scale arg
@@ -6336,9 +6969,29 @@ class ViewerWindow(QMainWindow):
 
         self.canvas.figure.clear()
         self.ax = self.canvas.figure.add_subplot(111)
-        self.ax.imshow(image, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        _im = self.ax.imshow(image, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
         apply_mpl_qss_style(self.canvas.figure, self.ax, None)
         self.ax.grid(False)  # No grid on the cube image
+
+        # ── Colorbar ─────────────────────────────────────────────────────
+        # A map of velocities or χ² is unreadable without a scale. Drawn from
+        # the same artist so it always matches the clipping/stretch applied
+        # above, and given its own axes so the image keeps its aspect ratio.
+        self.cbar = None
+        try:
+            cax = self.ax.inset_axes([1.02, 0.0, 0.035, 1.0])
+            self.cbar = self.canvas.figure.colorbar(_im, cax=cax)
+            _lbl = getattr(self, '_cbar_label', None)
+            if _lbl:
+                self.cbar.set_label(_lbl, fontsize=ui_fs(8))
+            _fg = '#D8DEE9'
+            self.cbar.ax.tick_params(labelsize=ui_fs(7), colors=_fg, which='both')
+            self.cbar.outline.set_edgecolor(_fg)
+            if self.cbar.ax.yaxis.label is not None:
+                self.cbar.ax.yaxis.label.set_color(_fg)
+        except Exception as e:
+            # A colorbar is a nicety; never let it stop the image drawing.
+            print(f'Colorbar skipped: {type(e).__name__}: {e}')
 
         # Restore the saved viewport before any overlays are redrawn so the
         # background-overlay restore picks up the correct (zoomed) limits.
@@ -6346,9 +6999,22 @@ class ViewerWindow(QMainWindow):
             self.ax.set_xlim(prev_xlim)
             self.ax.set_ylim(prev_ylim)
 
-        # Initialize red rectangle but keep it hidden initially
-        self.red_rect = patches.Rectangle((0, 0), 1, 1, linewidth=1.5, edgecolor='#d7801a', facecolor='none', visible=False)
+        # Selected-spaxel marker. The axes were just cleared, so this is a fresh
+        # patch — it must be put back where the selection actually is, otherwise
+        # every redraw (a scale change, a mask, a Rectify pass) silently loses
+        # the user's selection box.
+        self.red_rect = patches.Rectangle((0, 0), 1, 1, linewidth=1.5,
+                                          edgecolor='#cc2222' if getattr(self, 'locked', False)
+                                          else '#d7801a',
+                                          facecolor='none', visible=False)
         self.ax.add_patch(self.red_rect)
+        _cur = getattr(self, 'current_spaxel', None)
+        if _cur is not None:
+            try:
+                self.red_rect.set_xy((int(_cur[0]) - 0.5, int(_cur[1]) - 0.5))
+                self.red_rect.set_visible(True)
+            except (TypeError, ValueError, IndexError):
+                pass
         self._blue_rect = patches.Rectangle((0, 0), 1, 1, linewidth=2.0, edgecolor='#4fc3f7', facecolor='none', visible=False)
         self.ax.add_patch(self._blue_rect)
         # Restore blue rect position if an init-guess spaxel was previously set
@@ -6359,7 +7025,7 @@ class ViewerWindow(QMainWindow):
 
         # Overlay text for spaxel info (top-left corner of the image axes)
         self.spaxel_info_text = self.ax.text(
-            0.01, 0.99, '',
+            0.01, 0.99, self._map_readout().rstrip('\n'),
             transform=self.ax.transAxes,
             verticalalignment='top', horizontalalignment='left',
             fontsize=ui_fs(8), color='white',
@@ -6369,6 +7035,13 @@ class ViewerWindow(QMainWindow):
         if getattr(self, '_bkg_data', None) is not None:
             self._bkg_artist = None  # force redraw since axes were cleared
             self._draw_bkg_overlay()
+
+        # The S/N contour is a display preference, so it is restored here with
+        # the other overlays rather than being lost to whatever caused this
+        # redraw. `_snr_contour` refers to artists on the cleared axes, so drop
+        # the stale handle before redrawing.
+        self._snr_contour = None
+        self.draw_snr_contour(redraw=False)
 
         self.canvas.draw()
 
@@ -7019,6 +7692,48 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         apply_btn.clicked.connect(_apply)
         dlg.exec_()
 
+    @staticmethod
+    def _spread_grid_row(grid_layout, row, n_cols, spans=None, last_narrow=True):
+        """Spread one populated grid row across `n_cols` columns.
+
+        A spectral region's continuum row shares one QGridLayout with its line
+        rows, which are `n_cols` wide and carry equal stretch on every column.
+        A continuum row has a third as many cells, so at one column each it was
+        squeezed into the left ~40% of the frame while the line rows spread
+        across all of it. Spanning the spare columns puts the two on one width.
+
+        The last cell is the narrow 'x' delete button and stays at a single
+        column instead of stretching to match its neighbours. Returns the spans
+        used, so the header row can be given the button row's layout and keep
+        each label over the cell it names.
+        """
+        widgets, seen = [], set()
+        for c in range(grid_layout.columnCount()):
+            item = grid_layout.itemAtPosition(row, c)
+            w = item.widget() if item is not None else None
+            if w is not None and id(w) not in seen:
+                seen.add(id(w))
+                widgets.append(w)
+        if not widgets:
+            return spans
+        if spans is None:
+            n = len(widgets)
+            tail = 1 if (last_narrow and n > 1) else 0
+            free, cells = n_cols - tail, n - tail
+            if cells < 1 or free < cells:
+                return None          # already at least as wide as the grid
+            base, extra = divmod(free, cells)
+            # The leftmost cells hold the longest text (the region name, the
+            # parameter labels), so the remainder goes to them.
+            spans = [base + (1 if i < extra else 0) for i in range(cells)]
+            spans += [1] * tail
+        col = 0
+        for w, span in zip(widgets, spans):
+            grid_layout.removeWidget(w)
+            grid_layout.addWidget(w, row, col, 1, span)
+            col += span
+        return spans
+
     def add_continuum_buttons(self, regionID, grid_layout):
         # Spline regions get a dedicated, compact display (type, x-range, knot
         # count, Edit knots…). Linear regions use the original column grid.
@@ -7273,9 +7988,35 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             grid_layout.addWidget(del_line_btn, main_row_index, len(button_columns))
             self.buttons_dict[(regionID, f'del_line_{line_id}')] = del_line_btn
                 
+    def refresh_displayed_map(self):
+        """Re-render whichever fit map is on screen, from the current df_fit.
+
+        Both map paths (`show_quality_map` and the fitted-parameter maps in
+        `on_fit_button_click`) record a zero-argument re-render closure on the
+        viewer window; this replays it. Called after a cube fit and after every
+        Rectify pass, so the display tracks the fit instead of showing a picture
+        of whatever df_fit looked like when the user last clicked.
+
+        Silent no-op when no fit map is displayed (the raw cube image, say).
+        """
+        fn = getattr(self.viewer_window, '_map_refresher', None)
+        if fn is None or len(df_fit) == 0:
+            return
+        try:
+            fn()
+        except Exception as e:
+            # A stale refresher (its line deleted, say) must never abort a fit.
+            print(f'Map refresh skipped: {e}')
+            self.viewer_window._map_refresher = None
+
     def on_fit_button_click(self, frame_id, button_name):
         print(f'frame ID: {frame_id}, button name: {button_name}')
+        # Remember this map so a later fit/rectify pass can re-render it.
+        self.viewer_window._map_refresher = partial(
+            self._draw_param_map, frame_id, button_name)
+        self._draw_param_map(frame_id, button_name)
 
+    def _draw_param_map(self, frame_id, button_name):
         if len(df_fit) > 0:
             print(df_fit.iloc[0])
             gaussian_number = np.float64(button_name.split('~')[0])
@@ -7338,6 +8079,21 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 cmap='plasma'
                 scale='linear'
             
+            # Colorbar label: the line's name plus the quantity's unit, so a
+            # velocity map is not confused with a centroid map.
+            _units = {'amp_fit': flux_unit_str(), 'cen_fit': 'Å',
+                      'vel_fit': 'km/s', 'sigma_fit': 'km/s'}
+            _names = {'amp_fit': 'amplitude', 'cen_fit': 'centroid',
+                      'vel_fit': 'velocity', 'sigma_fit': 'σ'}
+            try:
+                _line = str(filtered_df['LineName'].iloc[0])
+            except (KeyError, IndexError):
+                _line = ''
+            _u = _units.get(df_param, '')
+            self.viewer_window._cbar_label = (
+                f"{_line} {_names.get(df_param, df_param)}"
+                + (f' [{_u}]' if _u else '')).strip()
+
             # fig,ax=plt.subplots()
             # ax.imshow(image_array,origin='lower',aspect='auto',cmap=cmap)
             self.viewer_window.draw_image(image_array, cmap=cmap, scale=scale,from_fits=False)
@@ -7368,14 +8124,19 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             menu.exec_()
 
-    def show_quality_map(self, column, cmap='plasma', center_zero=False, label=''):
-        """Render a per-spaxel goodness-of-fit map from a df_fit column."""
+    def show_quality_map(self, column, cmap='plasma', center_zero=False, label='',
+                         quiet=False):
+        """Render a per-spaxel goodness-of-fit map from a df_fit column.
+
+        `quiet` suppresses the "nothing to show" popup — set when this is being
+        replayed as an automatic refresh rather than requested by the user."""
         from PyQt5.QtWidgets import QMessageBox
         if len(df_fit) == 0 or column not in df_fit.columns:
-            QMessageBox.information(
-                self, 'Fit Quality Map',
-                f'No "{label or column}" values available.\n'
-                'Fit the cube (or load a fit produced by this version) first.')
+            if not quiet:
+                QMessageBox.information(
+                    self, 'Fit Quality Map',
+                    f'No "{label or column}" values available.\n'
+                    'Fit the cube (or load a fit produced by this version) first.')
             return
 
         cube_ny = int(FITS_DATA.shape[-2])
@@ -7404,9 +8165,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 if np.isfinite(vmax) and vmax > 0:
                     image_array = np.clip(image_array, None, vmax)
 
+        self.viewer_window._cbar_label = label or column
         self.viewer_window.draw_image(image_array, cmap=cmap, scale='linear',
                                       from_fits=False)
         self.viewer_window._quality_map_label = label or column
+        # Remember this map so a later fit/rectify pass can re-render it.
+        self.viewer_window._map_refresher = partial(
+            self.show_quality_map, column, cmap, center_zero, label, quiet=True)
 
     def save_file(self):
         options = QFileDialog.Options()
@@ -7622,6 +8387,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.source_name_button    = SpaxelButton(f'Source: {_name}',  'Source Name')
         self.source_redshift_button= SpaxelButton(f'z: {_z}',          'Source Redshift')
         self.resolving_power_button= SpaxelButton(f'R: {_rp}',         'Resolving Power')
+        if R_PROVENANCE:
+            self.resolving_power_button.setToolTip(
+                f'Resolving power R = {_rp}\nDerived from: {R_PROVENANCE}\n'
+                f'This is the nominal value for the configuration — click to override.')
 
         row1.addWidget(_cat_label('Observation:'))
         for btn in [self.source_name_button,
@@ -7785,6 +8554,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.load_cube_fit_button        = QPushButton('Load Fit')
         self.save_session_button         = QPushButton('Save Session')
         self.load_session_button         = QPushButton('Load Session')
+        self.save_template_button        = QPushButton('Save Template')
+        self.load_template_button        = QPushButton('Load Template')
 
         self.save_cube_fit_button.clicked.connect(partial(self.save_cube_fit))
         self.save_cube_fit_fitsfile_button.clicked.connect(partial(self.save_fit_result_fitsfile))
@@ -7793,10 +8564,19 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.load_session_button.clicked.connect(lambda: self.viewer_window.load_session())
         self.save_session_button.setToolTip('Save the entire tool state (cube, fits, display, background) to a .hcsession file')
         self.load_session_button.setToolTip('Restore a previously saved .hcsession and resume where you left off')
+        self.save_template_button.clicked.connect(partial(self.save_template))
+        self.load_template_button.clicked.connect(partial(self.load_template))
+        self.save_template_button.setToolTip(
+            'Save this model as a rest-frame template (.hct.csv) — rest wavelengths, '
+            'velocity offsets and intrinsic dispersions, so it applies to any galaxy')
+        self.load_template_button.setToolTip(
+            'Apply a rest-frame template to the cube that is open, placing its lines '
+            "at this galaxy's redshift and this instrument's resolution")
 
         for btn in [self.save_cube_fit_button, self.save_cube_fit_fitsfile_button,
                     self.load_cube_fit_button, self.save_session_button,
-                    self.load_session_button]:
+                    self.load_session_button, self.save_template_button,
+                    self.load_template_button]:
             btn.setFixedHeight(ui_px(28))
             row3.addWidget(btn)
         row3.addStretch()
@@ -7886,8 +8666,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 except (TypeError, ValueError, KeyError):
                     continue
                 v = _safe_float(rr.get(col))
-                if conv is not None and np.isfinite(v):
-                    v = conv(rr, v)
+                # The converter is called even when `col` itself is absent: a
+                # derived quantity (flux) has no stored column and builds its
+                # value from the row. Converters return NaN on bad input.
+                if conv is not None:
+                    try:
+                        v = _safe_float(conv(rr, v))
+                    except Exception:
+                        v = np.nan
                 out[(x, y)] = v
             return out
 
@@ -7908,6 +8694,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             # (column, suffix label, signed, default op, default thr, km/s conv)
             line_specs = [
                 ('amp_fit',   'amplitude',      False, '<',    None),
+                ('flux',      'flux',           False, '<',    None),
                 ('cen_fit',   'centroid (Å)',   False, '>',    None),
                 ('vel_fit',   'velocity (km/s)', True, 'abs>', 500.0),
                 ('sigma_fit', 'σ (km/s)',       False, '>',    300.0),
@@ -7921,12 +8708,24 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     sub = df_fit[(df_fit['LineID'] == lid) &
                                  (df_fit['region_ID'] == rid)]
                     for col, suffix, signed, dop, dthr in line_specs:
-                        if col not in df_fit.columns:
+                        # 'flux' is derived, not stored; it needs amp and sigma.
+                        if col == 'flux':
+                            if not {'amp_fit', 'sigma_fit'} <= set(df_fit.columns):
+                                continue
+                        elif col not in df_fit.columns:
                             continue
                         if col == 'sigma_fit':
                             conv = lambda rr, v: sigma_wl_to_kms(
                                 _safe_float(rr.get('sigma_fit')),
                                 _safe_float(rr.get('cen_fit')))
+                        elif col == 'flux':
+                            # Integrated Gaussian flux, amp * sigma_lambda * sqrt(2pi).
+                            # Not a stored column, so derive it from the row; sigma
+                            # is held in A, which is exactly what this needs.
+                            conv = lambda rr, v: (
+                                _safe_float(rr.get('amp_fit'))
+                                * _safe_float(rr.get('sigma_fit'))
+                                * np.sqrt(2.0 * np.pi))
                         else:
                             conv = None
                         vals = _per_spaxel_col(sub, col, conv=conv)
@@ -7994,6 +8793,48 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 out.add(xy)
         return out
 
+    def _show_scrollable_help(self, parent, title, html):
+        """A help window that scrolls instead of growing taller than the screen.
+
+        QMessageBox lays its text out at full height and simply overflows, so a
+        long help text is unreadable at the bottom. This caps the window at a
+        fraction of the available screen height and scrolls inside it.
+        """
+        d = QDialog(parent)
+        d.setWindowTitle(title)
+        lay = QVBoxLayout(d)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        body = QLabel(html)
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.RichText)
+        body.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        body.setAlignment(Qt.AlignTop)
+        body.setContentsMargins(ui_px(14), ui_px(14), ui_px(14), ui_px(14))
+
+        area = QScrollArea(d)
+        area.setWidget(body)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        lay.addWidget(area)
+
+        btns = QHBoxLayout()
+        btns.setContentsMargins(ui_px(10), 0, ui_px(10), ui_px(10))
+        btns.addStretch()
+        ok = QPushButton('Close', d)
+        ok.setDefault(True)
+        ok.clicked.connect(d.accept)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+
+        # Fit the screen, not the text: at most 70% of the available height.
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        w = ui_px(560)
+        h = int(avail.height() * 0.7) if avail is not None else ui_px(600)
+        d.resize(w, max(ui_px(260), min(h, ui_px(760))))
+        d.exec_()
+
     def fix_fits(self):
         global df_fit
         from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
@@ -8030,118 +8871,359 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         layout.setSpacing(10)
         layout.setContentsMargins(14, 14, 14, 14)
 
-        # ── Row: "Flag spaxels where: [map combo]" ────────────────────────
-        map_row = QHBoxLayout()
-        map_row.addWidget(QLabel('Flag spaxels where:'))
-        map_combo = QComboBox()
-        for m in maps:
-            map_combo.addItem(m['label'])
-        map_row.addWidget(map_combo, 1)
-        layout.addLayout(map_row)
-
-        # ── Row: "[op combo]  [threshold spin]" ───────────────────────────
-        thresh_row = QHBoxLayout()
-        op_combo = QComboBox()
-        op_combo.setFixedWidth(ui_px(80))
-        for disp, _tok in OPS:
-            op_combo.addItem(disp)
-        thresh_row.addWidget(op_combo)
-        spin = QDoubleSpinBox()
-        spin.setRange(-1e6, 1e6)
-        spin.setDecimals(3)
-        spin.setSingleStep(0.5)
-        thresh_row.addWidget(spin)
-        thresh_row.addStretch()
-        layout.addLayout(thresh_row)
-
-        # ── Opt-in: also re-fit failed (non-finite) spaxels ───────────────
-        nonfinite_chk = QCheckBox('Also re-fit failed (non-finite) spaxels')
+        # The "also re-fit failed spaxels" opt-in and the live count live below
+        # the criteria table; a non-finite metric already fails every criterion,
+        # so this only matters when no criterion is enabled.
+        nonfinite_chk = QCheckBox("Also re-fit failed (non-finite) spaxels")
         nonfinite_chk.setChecked(True)
-        layout.addWidget(nonfinite_chk)
-
-        # ── Live count preview ────────────────────────────────────────────
-        preview = QLabel()
-        preview.setWordWrap(True)
-        layout.addWidget(preview)
-
-        def _current():
-            midx = map_combo.currentIndex()
-            oidx = op_combo.currentIndex()
-            if not (0 <= midx < len(maps)) or not (0 <= oidx < len(OPS)):
-                return None
-            return maps[midx], OPS[oidx][1]
-
-        def _refresh(*_):
-            cur = _current()
-            if cur is None:
-                return
-            m, op = cur
-            vals = m['values']
-            thresh = spin.value()
-            flagged = self._rectify_flagged(vals, op, thresh)
-            n_nonfinite = sum(1 for v in vals.values() if not np.isfinite(_safe_float(v)))
-            extra = n_nonfinite if nonfinite_chk.isChecked() else 0
-            disp = {'>': f'> {thresh:g}', '<': f'< {thresh:g}',
-                    'abs>': f'|·| > {thresh:g}', 'abs<': f'|·| < {thresh:g}'}[op]
-            tail = (f" + {extra} failed" if extra else "")
-            preview.setText(
-                f"<b>{len(flagged) + extra}</b> of <b>{len(vals)}</b> spaxels "
-                f"(value {disp}{tail}) will be re-fit."
-            )
-
-        def _on_map_changed(midx):
-            if 0 <= midx < len(maps):
-                m = maps[midx]
-                # Set the suggested operator and threshold for this map.
-                tok_to_idx = {tok: i for i, (_d, tok) in enumerate(OPS)}
-                op_combo.blockSignals(True)
-                op_combo.setCurrentIndex(tok_to_idx.get(m['default_op'], 0))
-                op_combo.blockSignals(False)
-                spin.blockSignals(True)
-                spin.setValue(float(m['default_thr']))
-                spin.blockSignals(False)
-            _refresh()
-
-        map_combo.currentIndexChanged.connect(_on_map_changed)
-        op_combo.currentIndexChanged.connect(_refresh)
-        spin.valueChanged.connect(_refresh)
-        nonfinite_chk.toggled.connect(_refresh)
-        _on_map_changed(0)
 
         # ── Separator ─────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         layout.addWidget(sep)
 
+        # ── What counts as a GOOD fit ────────────────────────────────────
+        # This single table drives everything: a spaxel FAILING any ticked rule
+        # is re-fit, and only a spaxel PASSING all of them may seed a repair or
+        # be accepted as an improvement. One mechanism, so the spaxels being
+        # repaired and the spaxels trusted to repair them can never disagree.
+        good_hdr = QHBoxLayout()
+        good_hdr.addWidget(QLabel('<b>A fit is bad when</b>'))
+        mode_combo = QComboBox()
+        mode_combo.addItem('any (OR)', hcq.FLAG_ANY)
+        mode_combo.addItem('all (AND)', hcq.FLAG_ALL)
+        # Size to the widest entry, or the long labels either side squeeze the
+        # combo past its content width and Qt elides the text away to nothing.
+        mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        _fm = QFontMetrics(mode_combo.font())
+        mode_combo.setMinimumWidth(
+            max(_fm.width(mode_combo.itemText(i)) for i in range(mode_combo.count()))
+            + ui_px(44))
+        mode_combo.setToolTip(
+            'any — one tripped rule is enough (widest selection)\n'
+            'all — every ticked rule must trip (narrowest selection)\n\n'
+            'This changes WHICH SPAXELS ARE REPAIRED only. A spaxel must still\n'
+            'pass every ticked rule to be trusted as a seed for its neighbours.')
+        good_hdr.addWidget(mode_combo)
+        good_hdr.addWidget(QLabel('<b>of these trip:</b>'))
+        good_hdr.addStretch()
+        reset_crit = QPushButton('Reset')
+        reset_crit.setFixedWidth(ui_px(64))
+        reset_crit.setToolTip('Restore the default criteria, operators and limits')
+        good_hdr.addWidget(reset_crit)
+        layout.addLayout(good_hdr)
+
+        crit_cols = ['Use', 'Quality metric', 'Is bad when', 'Limit']
+        crit_table = QtWidgets.QTableWidget(0, len(crit_cols))
+        crit_table.setHorizontalHeaderLabels(crit_cols)
+        crit_table.verticalHeader().setVisible(False)
+        crit_table.horizontalHeader().setStretchLastSection(True)
+        crit_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        layout.addWidget(crit_table)
+
+        _op_combos = {}
+
+        def _row_specs():
+            """One row per per-spaxel map the fit can offer: the six calibrated
+            quality metrics first, then every fitted line parameter (amplitude,
+            integrated flux, centroid, velocity, sigma) and the stellar
+            kinematics. Defaults come from the map itself, so a velocity map
+            arrives as |.| > 500 and an amplitude map as < (its median).
+
+            `quality` marks the rows that describe how well the model fits, as
+            opposed to what it fitted — only those may gate donors (see below).
+            """
+            specs, by_col = [], {c.column: c for c in hcq.default_criteria()}
+            for m in maps:
+                lbl = m['label']
+                if lbl.startswith('Quality: '):
+                    short = lbl[len('Quality: '):]
+                    base = next((c for c in by_col.values() if c.label == short), None)
+                    specs.append({'label': short, 'values': m['values'],
+                                  'op': base.op if base else m['default_op'],
+                                  'thr': base.threshold if base else m['default_thr'],
+                                  'enabled': bool(base and base.enabled),
+                                  'quality': True,
+                                  'column': base.column if base else None})
+                else:
+                    specs.append({'label': lbl, 'values': m['values'],
+                                  'op': m['default_op'], 'thr': m['default_thr'],
+                                  'enabled': False, 'quality': False,
+                                  'column': None})
+            return specs
+
+        _specs = _row_specs()
+
+        def _fill_criteria(state=None):
+            """Populate the table. `state` is an optional {label: (enabled, op,
+            thr)} mapping from a previous session; anything it does not mention
+            keeps the map's own defaults."""
+            crit_table.blockSignals(True)
+            _op_combos.clear()
+            crit_table.setRowCount(len(_specs))
+            for r, sp in enumerate(_specs):
+                en, op, thr = sp['enabled'], sp['op'], sp['thr']
+                if state and sp['label'] in state:
+                    en, op, thr = state[sp['label']]
+                use = QtWidgets.QTableWidgetItem()
+                use.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                use.setCheckState(Qt.Checked if en else Qt.Unchecked)
+                use.setData(Qt.UserRole, r)
+                crit_table.setItem(r, 0, use)
+                name = QtWidgets.QTableWidgetItem(sp['label'])
+                name.setFlags(Qt.ItemIsEnabled)
+                name.setToolTip('Fit-quality metric — can also gate which spaxels '
+                                'may seed a repair.' if sp['quality'] else
+                                'Fitted parameter — selects spaxels to re-fit only.')
+                crit_table.setItem(r, 1, name)
+                # Per-row operator, so the limit means what it says: a z-score
+                # defaults to |·| > (both wings), a ratio to > , an amplitude to < .
+                combo = QComboBox()
+                for tok in hcq.OPS:
+                    combo.addItem(hcq.OP_LABELS[tok], tok)
+                idx = combo.findData(op)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+                combo.currentIndexChanged.connect(lambda *_: _refresh_count())
+                # resizeColumnsToContents ignores cell widgets, so size this one
+                # explicitly or the operator column can clip it.
+                _fmo = QFontMetrics(combo.font())
+                combo.setMinimumWidth(
+                    max(_fmo.width(combo.itemText(i)) for i in range(combo.count()))
+                    + ui_px(40))
+                crit_table.setCellWidget(r, 2, combo)
+                _op_combos[r] = combo
+                crit_table.setItem(r, 3, QtWidgets.QTableWidgetItem(f'{float(thr):g}'))
+            crit_table.resizeColumnsToContents()
+            crit_table.horizontalHeader().setStretchLastSection(True)
+            # Many rows now (one per line per parameter), so cap the height and
+            # let it scroll rather than pushing the buttons off screen.
+            h = crit_table.horizontalHeader().height() + 2
+            for r in range(crit_table.rowCount()):
+                h += crit_table.rowHeight(r)
+            crit_table.setMaximumHeight(ui_px(230))
+            crit_table.setMinimumHeight(min(h + ui_px(6), ui_px(230)))
+            crit_table.blockSignals(False)
+
+        def _read_rows():
+            """The table as [(spec, enabled, op, limit), ...]. An unusable limit
+            is repaired in place to that row's default rather than silently
+            disabling the rule."""
+            out = []
+            for r, sp in enumerate(_specs):
+                item = crit_table.item(r, 0)
+                if item is None:
+                    continue
+                combo = _op_combos.get(r)
+                op = combo.currentData() if combo is not None else sp['op']
+                thr = _safe_float(crit_table.item(r, 3).text()
+                                  if crit_table.item(r, 3) else '')
+                if (not np.isfinite(thr)) or (op in ('abs>', 'abs<') and thr < 0):
+                    thr = float(sp['thr'])
+                    crit_table.blockSignals(True)
+                    crit_table.setItem(r, 3, QtWidgets.QTableWidgetItem(f'{thr:g}'))
+                    crit_table.blockSignals(False)
+                out.append((sp, item.checkState() == Qt.Checked, op, thr))
+            return out
+
+        def _read_criteria():
+            """The QUALITY rows as a HyperCube_Quality criteria list.
+
+            Only quality metrics go into this list, because it is what gates
+            which spaxels may seed a repair and whether a re-fit improved
+            anything. A fitted parameter says what the gas is doing, not whether
+            the model describes it — a faint spaxel with a beautiful fit is a
+            perfectly good donor, and excluding it because its flux is low would
+            withhold exactly the neighbours a faint region needs.
+            """
+            out = []
+            for sp, en, op, thr in _read_rows():
+                if not sp['quality'] or not sp['column']:
+                    continue
+                base = next(c for c in hcq.default_criteria()
+                            if c.column == sp['column'])
+                out.append(hcq.replace(base, threshold=thr, op=op, enabled=en))
+            return out
+
+        # ── Live count of what will be re-fit ─────────────────────────────
+        layout.addWidget(nonfinite_chk)
+        preview = QLabel()
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
+
+        def _flagged_set():
+            """Spaxels that will be re-fit.
+
+            Every ticked row contributes, whether it is a quality metric or a
+            fitted parameter, combined by the any/all selector: `any` unions the
+            per-rule selections, `all` intersects them.
+            """
+            rows = [(sp, op, thr) for sp, en, op, thr in _read_rows() if en]
+            mode = mode_combo.currentData()
+            sel = None
+            for sp, op, thr in rows:
+                hit = self._rectify_flagged(sp['values'], op, thr)
+                sel = hit if sel is None else (sel & hit if mode == hcq.FLAG_ALL
+                                               else sel | hit)
+            flagged = set() if sel is None else sel
+
+            # A failed fit has no finite metrics, so no numeric rule selects it
+            # (_rectify_flagged skips non-finite values). This switch is the only
+            # way it gets repaired — or, unticked, explicitly left alone.
+            per = df_fit.drop_duplicates(subset=['spaxel_x', 'spaxel_y'])
+            failed, n_tot = set(), 0
+            for _, rr in per.iterrows():
+                try:
+                    xy = (int(rr['spaxel_x']), int(rr['spaxel_y']))
+                except (TypeError, ValueError):
+                    continue
+                n_tot += 1
+                if not np.isfinite(_safe_float(rr.get('qa_core_cont_ratio'))):
+                    failed.add(xy)
+            flagged = (flagged | failed) if nonfinite_chk.isChecked() else (flagged - failed)
+
+            # The repair loop skips anything below the SNR threshold, so count
+            # only what it will actually re-fit. Spaxels that were never fitted
+            # cannot appear here at all (they have no df_fit rows, so no map
+            # lists them) — this catches the other case: a spaxel that WAS
+            # fitted, before the user raised the SNR threshold.
+            _sm = globals().get('snr_map', None)
+            if _sm is not None and getattr(_sm, 'ndim', 0) == 2:
+                flagged = {(x, y) for (x, y) in flagged
+                           if 0 <= y < _sm.shape[0] and 0 <= x < _sm.shape[1]
+                           and _sm[y, x] >= snr_value}
+            return flagged, n_tot, len(failed)
+
+        def _refresh_count(*_):
+            try:
+                flagged, n_tot, n_nf = _flagged_set()
+            except Exception as e:
+                preview.setText(f'<i>could not evaluate: {e}</i>')
+                return
+            _join = ' AND ' if mode_combo.currentData() == hcq.FLAG_ALL else ' OR '
+            rule = _join.join(
+                f"{sp['label']} {hcq.OP_LABELS.get(op, op)} {thr:g}"
+                for sp, en, op, thr in _read_rows() if en) or 'no rule ticked'
+            if n_nf:
+                tail = (f' incl. {n_nf} failed' if nonfinite_chk.isChecked()
+                        else f', {n_nf} failed excluded')
+            else:
+                tail = ''
+            preview.setText(
+                f'<b>{len(flagged)}</b> of <b>{n_tot}</b> spaxels '
+                f'({rule}{tail}) will be re-fit.')
+
+        crit_table.itemChanged.connect(_refresh_count)
+        nonfinite_chk.toggled.connect(_refresh_count)
+        mode_combo.currentIndexChanged.connect(_refresh_count)
+
+        # Reopen with whatever was used last, so a Rectify run can be tuned
+        # across several passes without re-entering every setting.
+        _remembered = getattr(self, '_rectify_settings', None)
+        _fill_criteria((_remembered or {}).get('rows'))
+        _refresh_count()
+
+        # ── Repair strategy ───────────────────────────────────────────────
+        strat = QGridLayout()
+        strat.setContentsMargins(0, ui_px(4), 0, 0)
+        k_spin = QtWidgets.QSpinBox(); k_spin.setRange(1, 24); k_spin.setValue(3)
+        k_spin.setToolTip('How many good neighbours to try as independent seeds.\n'
+                          'The first one that lands a good fit wins, so a higher\n'
+                          'number costs nothing on easy spaxels.')
+        rad_spin = QtWidgets.QSpinBox(); rad_spin.setRange(1, 999); rad_spin.setValue(3)
+        rad_spin.setToolTip('How far to search for a good neighbour.\n'
+                            'Radius 1 is the 8 immediate neighbours; growing\n'
+                            'outward is what reaches the interior of a large\n'
+                            'patch of bad spaxels.')
+        pass_spin = QtWidgets.QSpinBox(); pass_spin.setRange(1, 20); pass_spin.setValue(5)
+        pass_spin.setToolTip('Repaired spaxels become seeds for their own\n'
+                             'neighbours, so repairs spread inward. Passes stop\n'
+                             'early as soon as one rescues nothing.')
+        strat.addWidget(QLabel('Seeds per spaxel:'), 0, 0)
+        strat.addWidget(k_spin, 0, 1)
+        strat.addWidget(QLabel('Max search radius:'), 0, 2)
+        strat.addWidget(rad_spin, 0, 3)
+        strat.addWidget(QLabel('Max passes:'), 0, 4)
+        strat.addWidget(pass_spin, 0, 5)
+        strat.setColumnStretch(6, 1)
+        layout.addLayout(strat)
+
+        never_worse_chk = QCheckBox('Never accept a fit worse than the one it replaces')
+        never_worse_chk.setChecked(True)
+        never_worse_chk.setToolTip('Keeps the existing fit as a candidate, so a '
+                                   'pass can only improve a spaxel.')
+        layout.addWidget(never_worse_chk)
+
+        def _reset_criteria():
+            _fill_criteria(None)
+            _refresh_count()
+        reset_crit.clicked.connect(_reset_criteria)
+
+        # Restore the rest of last run's settings (the criteria table was
+        # filled from it above; these widgets exist only now).
+        if _remembered:
+            k_spin.setValue(int(_remembered.get('seeds_k', k_spin.value())))
+            rad_spin.setValue(int(_remembered.get('radius_cap', rad_spin.value())))
+            pass_spin.setValue(int(_remembered.get('max_passes', pass_spin.value())))
+            never_worse_chk.setChecked(bool(_remembered.get('never_worse', True)))
+            nonfinite_chk.setChecked(bool(_remembered.get('nonfinite', True)))
+            _mi = mode_combo.findData(_remembered.get('mode', hcq.FLAG_ANY))
+            if _mi >= 0:
+                mode_combo.setCurrentIndex(_mi)
+            _refresh_count()
+
         # ── Help text ─────────────────────────────────────────────────────
         HELP = (
             "<b>Rectify Bad Fits</b> re-fits the spaxels you flag here, seeding "
-            "each from its best-fitting 8-neighbour (and falling back to a small "
-            "set of targeted restarts). Only the flagged spaxels change.<br><br>"
-            "<b>Which map?</b> Flag spaxels on any map currently derivable from "
-            "the fit:<br>"
-            "• <b>Quality metrics</b> — measure goodness-of-fit. "
-            "<i>Core / continuum ratio</i> (≈1 good, ≫1 = missed line profile; "
-            "try &gt; 2) is the recommended default; <i>signed residual (z)</i> "
-            "and <i>runs (z)</i> are signed; <i>reduced χ²</i> (continuum / "
-            "native) catch gross failures (try &gt; 5).<br>"
-            "• <b>Emission-line parameters</b> — each line's fitted amplitude, "
-            "centroid, velocity (km/s), and σ (km/s). Useful to catch "
-            "non-physical outliers, e.g. a velocity map with runaway spaxels.<br>"
-            "• <b>Stellar kinematics</b> — V and σ (km/s), if a stellar cube fit "
-            "exists.<br><br>"
-            "<b>Operator &amp; threshold.</b> The threshold is a signed number; "
-            "the operator sets the direction:<br>"
-            "&nbsp;&nbsp;<b>&gt; T</b> — value above T<br>"
-            "&nbsp;&nbsp;<b>&lt; T</b> — value below T (T may be negative, "
-            "e.g. <i>vel &lt; −300</i>)<br>"
-            "&nbsp;&nbsp;<b>|·| &gt; T</b> — magnitude above T "
-            "(both wings, e.g. <i>|vel| &gt; 500</i>)<br>"
-            "&nbsp;&nbsp;<b>|·| &lt; T</b> — magnitude below T (near zero)<br><br>"
-            "For a velocity map you can therefore flag one wing (&gt; / &lt;) or "
-            "both (|·| &gt;). The live count updates as you adjust.<br><br>"
-            "<b>Failed fits.</b> Spaxels whose value is non-finite (NaN / ±Inf) "
-            "are not selected by the numeric test; tick the checkbox to re-fit "
+            "each from the best good fits in its neighbourhood (and falling back "
+            "to a small set of targeted restarts). Only the flagged spaxels "
+            "change.<br><br>"
+            "<b>any (OR) / all (AND).</b> With <i>any</i>, one tripped rule marks a spaxel "
+            "for repair — the widest selection, and the complement of \"good\". "
+            "With <i>all</i>, every ticked rule must trip, which narrows it to "
+            "spaxels that are unambiguously broken on every count.<br><br>"
+            "<b>This setting changes only which spaxels are repaired.</b> A "
+            "spaxel must still pass <i>every</i> ticked rule to be trusted as a "
+            "seed for its neighbours or accepted as an improvement — loosening "
+            "what gets repaired must not loosen what does the repairing. With "
+            "<i>all</i> there is therefore a middle band, failing some rules but "
+            "not all, which is neither repaired nor used as a seed.<br><br>"
+            "<b>Seeds per spaxel.</b> Each of the best <i>K</i> good neighbours "
+            "is tried as an independent starting point and the best result is "
+            "kept. The search stops at the first seed that produces a good fit, "
+            "so raising K only costs time on spaxels that are actually hard."
+            "<br><br>"
+            "<b>Max search radius.</b> Radius 1 is the 8 immediate neighbours. "
+            "If none of them is good the search grows outward, which is what "
+            "lets the middle of a large bad region get a real spatial starting "
+            "point instead of the generic initial guess. Nearer neighbours are "
+            "always preferred over better-scoring distant ones.<br><br>"
+            "<b>Max passes.</b> A repaired spaxel immediately becomes a valid "
+            "seed for its own neighbours, so repairs spread inward from the edge "
+            "of a bad patch. Passes stop as soon as one rescues nothing.<br><br>"
+            "<b>Never accept a worse fit.</b> The existing fit competes as a "
+            "candidate, so a Rectify run can only improve a spaxel. Leave this "
+            "on unless you are deliberately forcing a re-fit.<br><br>"
+            "<b>Operator &amp; limit.</b> Each metric carries its own operator, "
+            "so the number you type means what it says:<br>"
+            "&nbsp;&nbsp;<b>&gt; T</b> — bad when the value is above T<br>"
+            "&nbsp;&nbsp;<b>&lt; T</b> — bad when below T (T may be negative)<br>"
+            "&nbsp;&nbsp;<b>|·| &gt; T</b> — bad when the magnitude exceeds T "
+            "(both wings — the right choice for the signed z-scores)<br>"
+            "&nbsp;&nbsp;<b>|·| &lt; T</b> — bad when the magnitude is below T<br>"
+            "The count underneath updates as you change anything.<br><br>"
+            "<b>Suggested limits.</b> <i>Core / continuum ratio</i> (≈1 good, "
+            "≫1 = missed line profile) &gt; 2 is the recommended default; "
+            "<i>signed residual (z)</i> and <i>runs (z)</i> are z-scores, so "
+            "|·| &gt; 3; <i>reduced χ²</i> (continuum / native) catch gross "
+            "failures at &gt; 5, and the weighted χ² sits near 1 for a good fit "
+            "with a correct noise model, so &gt; 3.<br><br>"
+            "<b>How the score is built.</b> Each metric is rescaled so that its "
+            "limit is exactly 1.0 — for the &gt; forms, measured from the "
+            "metric's ideal value (1 for the ratios and reduced χ², 0 for the "
+            "z-scores). A fit is good only if <i>every</i> ticked metric stays "
+            "at or below 1; the mean across them ranks fits against each other, "
+            "which is what picks the best neighbour and decides whether a "
+            "re-fit improved anything.<br><br>"
             "those too (recommended when flagging on a quality metric)."
         )
 
@@ -8149,9 +9231,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         btn_row = QHBoxLayout()
         help_btn = QPushButton('?')
         help_btn.setFixedWidth(ui_px(28))
-        help_btn.setToolTip('Explain the maps, operators and thresholds')
-        help_btn.clicked.connect(
-            lambda: QMessageBox.information(dlg, 'Rectify — Help', HELP))
+        help_btn.setToolTip('Explain the metrics, operators and limits')
+        help_btn.clicked.connect(lambda: self._show_scrollable_help(
+            dlg, 'Rectify — Help', HELP))
         btn_row.addWidget(help_btn)
         btn_row.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -8161,23 +9243,41 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         btn_row.addWidget(buttons)
         layout.addLayout(btn_row)
 
+        def _remember():
+            self._rectify_settings = {
+                # Keyed by row label, so a saved setting still lands on the
+                # right row if the model's lines change between openings.
+                'rows': {sp['label']: (en, op, thr)
+                         for sp, en, op, thr in _read_rows()},
+                'seeds_k': k_spin.value(),
+                'radius_cap': rad_spin.value(),
+                'max_passes': pass_spin.value(),
+                'never_worse': never_worse_chk.isChecked(),
+                'nonfinite': nonfinite_chk.isChecked(),
+                'mode': mode_combo.currentData(),
+            }
+
+        # Remember on Cancel too: closing the window is not a reason to throw
+        # away the limits the user just dialled in.
+        dlg.finished.connect(lambda *_: _remember())
+
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        cur = _current()
-        if cur is None:
-            return
-        m, op = cur
-        thresh = spin.value()
-        flagged = self._rectify_flagged(m['values'], op, thresh)
-        if nonfinite_chk.isChecked():
-            flagged |= {xy for xy, v in m['values'].items()
-                        if not np.isfinite(_safe_float(v))}
+        criteria = _read_criteria()
+        flagged, _n_tot, _n_nf = _flagged_set()
         if not flagged:
-            QMessageBox.information(self, 'Rectify Bad Fits',
-                                    'No spaxels matched the criterion.')
+            QMessageBox.information(
+                self, 'Rectify Bad Fits',
+                'No spaxels are flagged by the current rules.\n\n'
+                'Tick a metric, loosen a limit, or enable "Also re-fit failed '
+                'spaxels".')
             return
-        self.fit_cube(refit=True, bad_spaxels_override=flagged)
+        self.fit_cube(refit=True, bad_spaxels_override=flagged,
+                      criteria=criteria,
+                      seeds_k=k_spin.value(), radius_cap=rad_spin.value(),
+                      max_passes=pass_spin.value(),
+                      never_worse=never_worse_chk.isChecked())
 
     def _mask_keep_field(self, m, op, thresh):
         """Build (keep_field, mask_array) for the current map criterion.
@@ -8502,21 +9602,61 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         variants.append(('equal-split', p))
         return variants
 
-    def _fit_candidate(self, z, candidate_params):
+    @staticmethod
+    def _good_donors(i, j, good_set, scores, radius_cap=3, k=3):
+        """The best good spaxels near (i, j) to seed a repair from.
+
+        Searches Chebyshev rings outward — radius 1 is the 8 immediate
+        neighbours, radius 2 the next 16, and so on — and returns the members of
+        the FIRST ring that contains any good spaxel, ranked best-score-first and
+        truncated to `k`. Nearer donors are always preferred over better-scoring
+        distant ones: the spatial-coherence assumption weakens with distance, so
+        a merely-adequate neighbour is a more honest prior than an excellent
+        spaxel three pixels away.
+
+        Growing the radius is what lets the interior of a large bad patch get a
+        real spatial seed at all; at radius 1 only its rim has good neighbours.
+
+        Returns (donors, radius) with donors a list of (x, y), or ([], 0).
+        """
+        for r in range(1, max(1, int(radius_cap)) + 1):
+            ring = []
+            for di in range(-r, r + 1):
+                for dj in range(-r, r + 1):
+                    # Ring, not filled square: inner radii were already searched.
+                    if max(abs(di), abs(dj)) != r:
+                        continue
+                    nb = (i + di, j + dj)
+                    if nb in good_set:
+                        ring.append(nb)
+
+            if ring:
+                ring.sort(key=lambda xy: scores.get(xy, np.inf))
+                return ring[:max(1, int(k))], r
+        return [], 0
+
+    def _fit_candidate(self, z, candidate_params, criteria=None):
         """Fit the current spaxel with candidate_params and return
-        (qa_core_cont_ratio, rows) WITHOUT committing: the rows fit_spaxel
-        appended are popped back off fit_results so the caller can keep only
-        the best candidate. A failed/degenerate candidate returns +inf."""
+        (score, good, rows) WITHOUT committing: the rows fit_spaxel appended are
+        popped back off fit_results so the caller can keep only the best
+        candidate. A failed/degenerate candidate returns (+inf, False, rows).
+
+        `criteria` is a HyperCube_Quality criteria list; the score is the
+        composite badness over the enabled metrics (lower is better) and `good`
+        is the AND-gate over them. With criteria=None the module defaults apply,
+        which is the core/continuum ratio at 2.0 — the historical behaviour.
+        """
         global fit_results
+        if criteria is None:
+            criteria = hcq.default_criteria()
         snap = len(fit_results)
         self.fit_spaxel(z, max_nfev=512, params_to_use=candidate_params)
         rows = fit_results[snap:]
         del fit_results[snap:]
-        ratio = np.inf
-        if rows:
-            r = _safe_float(rows[0].get('qa_core_cont_ratio'))
-            ratio = r if np.isfinite(r) else np.inf
-        return ratio, rows
+        if not rows:
+            return np.inf, False, rows
+        # Quality columns are per spaxel, repeated across the line rows.
+        return hcq.score(rows[0], criteria), hcq.is_good(rows[0], criteria), rows
 
     def _staged_fit(self, model, y, params, wavelengths, max_nfev):
         """Sequential core→outflow fit (breaks the narrow/broad degeneracy).
@@ -8853,6 +9993,211 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         apply_btn.clicked.connect(apply_choice)
         dlg.exec_()
+
+    # ── Rest-frame model templates ───────────────────────────────────────
+    #
+    # A template is the model with the galaxy taken out of it: rest wavelengths,
+    # velocity offsets from systemic, intrinsic dispersions. Saving converts the
+    # current model out of the observed frame; loading converts a template into
+    # it for whatever cube is open. See HyperCube_Templates_SPEC.md.
+
+    def _template_lsf(self):
+        """The LSF for the open cube, or None (with a dialog) if unknown."""
+        try:
+            return hct.lsf_for_cube(FITS_HEADER, wavelengths)
+        except Exception as e:
+            QMessageBox.warning(
+                self, 'Templates',
+                f'No line-spread function is known for this cube:\n\n{e}\n\n'
+                'Templates store intrinsic velocity dispersions, which cannot be '
+                'converted without one. Add the instrument to HyperCube_LSF.py.')
+            return None
+
+    def save_template(self):
+        """Write the current model out as a rest-frame template."""
+        if FITS_DATA is None or not len(df):
+            QMessageBox.warning(self, 'Save Template',
+                                'Load a cube and build a model first.')
+            return
+        z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else np.nan
+        if not np.isfinite(z):
+            QMessageBox.warning(
+                self, 'Save Template',
+                'This cube has no redshift set. A template is stored in the rest '
+                'frame, so the redshift is what makes the conversion possible — '
+                'set it with the "z:" button first.')
+            return
+        lsf = self._template_lsf()
+        if lsf is None:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Template', '',
+            'HyperCube Template (*.hct.csv);;All Files (*)')
+        if not path:
+            return
+        if not path.endswith('.hct.csv'):
+            path = path[:-4] if path.endswith('.csv') else path
+            path += '.hct.csv'
+        try:
+            t = hct.template_from_model(
+                df_obs, df_cont, df, lsf,
+                meta={'instrument': str(FITS_HEADER.get('INSTRUME', '')).strip(),
+                      'template_name': os.path.splitext(
+                          os.path.basename(path))[0].replace('.hct', ''),
+                      'snr_threshold': snr_value,
+                      'sequential': bool(getattr(self, '_sequential_fit', False)),
+                      'n_components': int(pd.to_numeric(
+                          df['Rest Wavelength'], errors='coerce').round(4)
+                          .value_counts().max())})
+            hct.write_template(path, t)
+        except Exception as e:
+            QMessageBox.critical(self, 'Save Template', f'Could not save:\n{e}')
+            return
+
+        notes = getattr(t, 'conversion_notes', [])
+        msg = (f'Saved {len(t.lines)} lines and {len(t.regions)} continuum '
+               f'region(s) to\n{os.path.basename(path)}\n\n'
+               f'LSF: {lsf.label}')
+        if notes:
+            # Not a warning — a statement about what the numbers now mean.
+            msg += (f'\n\n{len(notes)} sigma bound(s) were below the instrumental '
+                    'width, so as intrinsic values they are "no constraint" and '
+                    'were stored as 0. Applying this template will show them at '
+                    "the instrument's own floor, which varies with wavelength.")
+        QMessageBox.information(self, 'Save Template', msg)
+        print(f'Template saved: {path}')
+
+    def load_template(self):
+        """Apply a rest-frame template to the cube that is currently open."""
+        global df, df_cont, df_obs, snr_map, snr_value
+        global base_df_cont, base_df, spaxel_overrides
+        if FITS_DATA is None:
+            QMessageBox.warning(self, 'Load Template', 'Open a cube first.')
+            return
+        z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else np.nan
+        if not np.isfinite(z):
+            QMessageBox.warning(
+                self, 'Load Template',
+                'This cube has no redshift set. A template is stored in the rest '
+                'frame, so the redshift is what places its lines — set it with '
+                'the "z:" button first.')
+            return
+        lsf = self._template_lsf()
+        if lsf is None:
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load Template', '',
+            'HyperCube Template (*.hct.csv *.csv);;All Files (*)')
+        if not path:
+            return
+
+        # Applying a template reads a reference spectrum and recomputes the S/N
+        # map over the whole cube — on a MUSE cube that is long enough to look
+        # like a hang, so it borrows the status-bar bar the FITS loader uses.
+        vw = self.viewer_window
+        vw._load_progress_begin(path, what='template')
+        try:
+            self._load_template_impl(path, z, lsf)
+        finally:
+            vw._load_progress_end()
+
+    def _load_template_impl(self, path, z, lsf):
+        """The work of `load_template`; the wrapper owns the progress bar."""
+        global df, df_cont, df_obs, snr_map, snr_value
+        global base_df_cont, base_df, spaxel_overrides
+        vw = self.viewer_window
+        vw._load_progress(5, 'Reading template…')
+        try:
+            t = hct.read_template(path)
+        except Exception as e:
+            QMessageBox.critical(self, 'Load Template', str(e))
+            return
+
+        try:
+            regions_obs = [(_safe_float(r['x1_rest_A']) * (1 + z),
+                            _safe_float(r['x2_rest_A']) * (1 + z))
+                           for _, r in t.regions.iterrows()]
+            ref = getattr(self.viewer_window, 'current_spaxel', None)
+            # The reference spaxel's own spectrum seeds this galaxy's continuum
+            # and sets the amplitude scale above it. Without it the model would
+            # start with a zero continuum, far below the data.
+            vw._load_progress(20, 'Measuring the continuum from this cube…')
+            ref_spec, ref_xy = hct.reference_spectrum(
+                FITS_DATA, wavelengths, regions_obs,
+                ref_xy=(int(ref[0]), int(ref[1])) if ref else None)
+            vw._load_progress(45, 'Placing lines at this redshift…')
+            new_obs, new_cont, new_df, rep = hct.expand(
+                t, z, wavelengths, lsf,
+                target_name=(str(df_obs.loc[0, 'sourcename']) if len(df_obs) else ''),
+                ref_spectrum=ref_spec,
+                instrument=FITS_HEADER.get('INSTRUME'))
+        except Exception as e:
+            QMessageBox.critical(self, 'Load Template',
+                                 f'Could not apply this template:\n\n{e}')
+            return
+        if not len(new_df):
+            QMessageBox.warning(
+                self, 'Load Template',
+                'None of this template\'s lines fall inside this cube\'s '
+                'wavelength coverage.')
+            return
+
+        # Keep this cube's own source name / redshift / R; the template has no
+        # business overwriting them, and R came from the cube itself.
+        new_obs.loc[0, 'sourcename'] = df_obs.loc[0, 'sourcename']
+        new_obs.loc[0, 'redshift'] = df_obs.loc[0, 'redshift']
+        if str(df_obs.loc[0, 'resolvingpower']).strip():
+            new_obs.loc[0, 'resolvingpower'] = df_obs.loc[0, 'resolvingpower']
+        df_obs, df_cont, df = new_obs, new_cont, new_df
+
+        # A template defines a new model, so the locked per-spaxel schema and any
+        # overrides taken against the old one no longer describe anything.
+        base_df_cont = base_df = None
+        spaxel_overrides = {}
+
+        vw._load_progress(60, 'Applying constraints…')
+        thresh = _safe_float(t.meta.get('snr_threshold'))
+        applied_snr = ''
+        if np.isfinite(thresh) and thresh > 0:
+            try:
+                vw._load_progress(65, 'Computing the S/N map…')
+                d_lam = float(np.median(np.diff(wavelengths)))
+                snr_map = compute_snr_map(FITS_DATA, wavelengths, df['Centroid_0'],
+                                          50 * d_lam, 60 * d_lam, 70 * d_lam)
+                snr_value = float(thresh)
+                invalidate_snr_cache('template applied')
+                n_pass = int(np.nansum(snr_map >= snr_value))
+                # Show it: a mask you cannot see is a mask you will forget is
+                # there, and the template just changed which spaxels it selects.
+                self.viewer_window.set_snr_contour_visible(True)
+                applied_snr = (f'\n\nS/N mask from the template: >= {snr_value:g} '
+                               f'({n_pass} spaxels pass), shown as a red contour.')
+            except Exception as e:
+                applied_snr = f'\n\nS/N mask could not be applied: {e}'
+
+        vw._load_progress(90, 'Rebuilding the fit panel…')
+        self.rebuild_fit_panel(show_fit=False)
+        vw._load_progress(100)
+
+        lines = [f'Applied {t.name!r} to {os.path.basename(getattr(self.viewer_window, "fits_path", "") or "this cube")}.',
+                 f'{len(df)} of {len(t.lines)} lines, '
+                 f'{len(df_cont)} of {len(t.regions)} continuum region(s).',
+                 f'LSF: {rep.lsf_label}',
+                 f'Continuum seeded from spaxel {ref_xy}; amplitude scale '
+                 f'{rep.amp_scale:.4g}']
+        if rep.dropped_lines:
+            lines.append('\nOutside this cube\'s coverage, so dropped:')
+            lines += [f'   {nm} ({why})' for nm, why, _ in rep.dropped_lines[:8]]
+        if rep.dropped_constraints:
+            lines.append(f'\n{len(rep.dropped_constraints)} constraint(s) naming a '
+                         'dropped line were removed.')
+        for grp, action, detail in rep.kgroup_actions:
+            lines.append(f'\nK-group {grp}: {action} — {detail}')
+        QMessageBox.information(self, 'Load Template',
+                                '\n'.join(lines) + applied_snr)
+        print('\n'.join(lines))
 
     def save_cube_fit(self):
         global df, df_cont, df_obs, df_fit, df_stellar
@@ -9314,6 +10659,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     def _snr_map_cache_key(self, linewl, search_window_width, continuum_offset, continuum_width):
         """Everything the S/N map depends on — deliberately NOT the threshold.
 
+        Includes `_SNR_FORMULA_VERSION`, so a map cached (or restored from a
+        session) under an older definition of S/N is recomputed rather than
+        silently reused.
+
         The map is a property of the cube, the wavelength grid, the line centres
         and the three window widths; `Nsigma` only picks the contour level drawn
         on top of it. Keyed on the cube's identity rather than its contents: a
@@ -9332,6 +10681,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # Centroid_0 straight off df), but it is keyed anyway so that if it ever
         # starts to, a stale map cannot survive the change.
         return (
+            _SNR_FORMULA_VERSION,
             str(getattr(vw, 'fits_path', '')), int(getattr(vw, 'fits_ext', 0)),
             tuple(np.shape(FITS_DATA)), wl_sig, centroids,
             tuple(_as_float_list(linewl)),
@@ -9339,53 +10689,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         )
 
     def compute_snr_map(self, search_window_width, continuum_offset, continuum_width):
-        """The S/N map itself: per spaxel, the best S/N over all lines in `df`.
-
-        S/N per line = (95th-percentile flux in a window around the line centre)
-        / (MAD-based noise in the two continuum flanks). Every mask depends only
-        on `wavelengths` and the line centre — not on the spaxel — so each line
-        is one pass of whole-array operations rather than nx·ny Python
-        iterations.
-        """
-        _, nx, ny = np.shape(FITS_DATA)
-        per_line = []
-        for _, row in df.iterrows():
-            line_center = row['Centroid_0']
-            try:
-                line_center = float(line_center)
-            except (TypeError, ValueError):
-                continue
-            if not np.isfinite(line_center):
-                continue
-
-            line_mask = ((wavelengths >= line_center - search_window_width / 2) &
-                         (wavelengths <= line_center + search_window_width / 2))
-            # Both flanks in one mask: the noise is a median, which does not care
-            # about the order the two sides are concatenated in.
-            cont_mask = (((wavelengths >= line_center - continuum_offset - continuum_width) &
-                          (wavelengths <= line_center - continuum_offset)) |
-                         ((wavelengths <= line_center + continuum_offset + continuum_width) &
-                          (wavelengths >= line_center + continuum_offset)))
-
-            peak_flux = (np.percentile(FITS_DATA[line_mask], 95, axis=0)
-                         if line_mask.any() else np.zeros((nx, ny)))
-            if cont_mask.sum() > 1:
-                cont = FITS_DATA[cont_mask]
-                noise = 1.4826 * np.median(np.abs(cont - np.median(cont, axis=0)), axis=0)
-            else:
-                noise = np.full((nx, ny), np.nan)
-
-            with np.errstate(divide='ignore', invalid='ignore'):
-                usable = np.isfinite(noise) & (noise > 0)
-                per_line.append(np.where(usable, peak_flux / np.where(usable, noise, 1.0), 0.0))
-
-        if not per_line:
-            return np.zeros((nx, ny))
-        with warnings.catch_warnings():
-            # A spaxel that is NaN in every line's window has no S/N to report;
-            # nanmax says so with a warning and a NaN, which is the answer.
-            warnings.simplefilter('ignore', RuntimeWarning)
-            return np.nanmax(np.stack(per_line, axis=0), axis=0)
+        """The S/N map for the current model. The definition itself lives in the
+        module-level `compute_snr_map`, which the headless runner shares so the
+        two cannot drift apart the way the parameter builders did."""
+        return compute_snr_map(FITS_DATA, wavelengths, df['Centroid_0'],
+                               search_window_width, continuum_offset,
+                               continuum_width)
 
     def calculate_snr_map(self, linewl, Nsigma, search_window_width=None, continuum_offset=None, continuum_width=None):
         """
@@ -9406,7 +10715,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         Returns:
             snr_map (numpy.ndarray): 2D array of max SNR values across emission lines for each spaxel
         """
-        global snr_map, _SNR_CACHE
+        global snr_map, snr_value, _SNR_CACHE
 
         # Set default window sizes if not specified
         if search_window_width is None:
@@ -9433,10 +10742,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             print(f'  S/N map computed in {time.perf_counter() - t0:.2f} s '
                   f'(cached — changing the threshold alone will reuse it).')
 
-        # Draw the contour on the viewer window at the specified Nsigma level
-        contour = self.viewer_window.ax.contour(snr_map, levels=[Nsigma], colors='red', linewidths=1.5)
-
-        # Update the canvas
+        # Draw through the viewer's own contour path so the artists are tracked
+        # and survive the next redraw, and switch the toggle on so the user can
+        # see (and undo) that the mask is being shown.
+        snr_value = float(Nsigma)
+        self.viewer_window.set_snr_contour_visible(True)
         self.viewer_window.canvas.draw()
         self.viewer_window.spectrum_canvas.draw_idle()
 
@@ -9605,6 +10915,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for rid in np.unique(np.int64(df_cont['region_ID'])):
             vw.rebuild_plot(rid, from_file=True, show_init=True, show_fit=False, x=cx, y=cy)
         vw.spectrum_canvas.draw_idle()
+        # This spaxel's fit was just removed from df_fit; a map still showing its
+        # old value would be lying about a spaxel that no longer has a fit.
+        self.refresh_displayed_map()
         print(f"Edit mode: spaxel ({cx},{cy}). Adjust guesses, then 'Fit This Spaxel'.")
 
     def cancel_spaxel_edit(self):
@@ -10102,6 +11415,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for line_name, additions in plan.constraint_additions.items():
             self._rewrite_smart_constraints(line_name, add=additions)
         if plan.kgroup_assignments:
+            # Smart Constraints rebuilds the grouping from scratch, so any
+            # hand-picked anchor belonged to the grouping it replaces; leaving
+            # the flags would silently hand the new groups an anchor nobody
+            # chose for them.
+            if 'kgroup_ref' in df.columns:
+                df['kgroup_ref'] = False
             for lid, group in plan.kgroup_assignments.items():
                 df.loc[df['Line_ID'] == lid, 'kgroup'] = group
             self._sync_kgroup_constraints()
@@ -10166,19 +11485,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             "(picking a new scenario, toggling options) without touching "
             "constraints you typed by hand in the Edit Line dialog."
         )
-        d = QDialog(parent)
-        d.setWindowTitle('Smart Constraints — Help')
-        d.setMinimumWidth(ui_px(380))
-        lay = QVBoxLayout(d)
-        lbl = QLabel(text, d)
-        lbl.setWordWrap(True)
-        lbl.setTextFormat(Qt.RichText)
-        lay.addWidget(lbl)
-        ok = QPushButton('OK', d)
-        ok.setDefault(True)
-        ok.clicked.connect(d.accept)
-        lay.addWidget(ok, alignment=Qt.AlignRight)
-        d.exec_()
+        # Same scrolling treatment as the Rectify help: this text is long
+        # enough to run off the bottom of the screen if laid out at full height.
+        self._show_scrollable_help(parent, 'Smart Constraints — Help', text)
 
     def open_stellar_templates(self):
         """Open the Stellar Templates window for the current spaxel; on Accept,
@@ -10298,8 +11607,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         spectrum = np.nan_to_num(vw.get_spectrum_at_spaxel(cx, cy))
         z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
         z = 0.0 if not np.isfinite(z) else z
-        R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
-        R = 3000.0 if not np.isfinite(R) or R <= 0 else R
+        R = resolving_power_for_templates()
         fit_range = settings['fit_range']
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -10485,120 +11793,47 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         full line fit, returning only small row dicts (kinematics-only — no
         per-spaxel optimal templates; those recompute lazily on view)."""
         global fit_results
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor, as_completed
         from PyQt5.QtWidgets import QApplication
 
-        cube = np.ascontiguousarray(FITS_DATA)
-        shm = shared_memory.SharedMemory(create=True, size=int(cube.nbytes))
-        err_shm = None
+        stellar_specs, stellar_mask = [], None
+        if 'cont_type' in df_cont.columns:
+            for _, r in df_cont[df_cont['cont_type'] == 'stellar'].iterrows():
+                stellar_specs.append(dict(rid=int(r['region_ID']),
+                                          library=str(r.get('stellar_library', '')),
+                                          fit_range=(float(r['x1']), float(r['x2'])),
+                                          moments=int(r.get('stellar_moments', 2) or 2)))
+            if stellar_specs:
+                stellar_mask = df['Centroid_0'].to_numpy()
+
+        # Precompute RA/Dec here so the WCS never enters a worker.
+        xs = np.array([ij[0] for ij in gated])
+        ys = np.array([ij[1] for ij in gated])
         try:
-            shm_arr = np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)
-            shm_arr[:] = cube[:]
+            ras, decs = self.viewer_window.pixel_to_ra_dec(xs, ys)
+            ras = np.atleast_1d(ras); decs = np.atleast_1d(decs)
+        except Exception:
+            ras = np.full(len(gated), np.nan); decs = np.full(len(gated), np.nan)
 
-            # Measurement errors, shared read-only the same way (float32 keeps
-            # the extra footprint to half the cube's).
-            err_ctx = {}
-            if ERROR_CUBE is not None and ERROR_CUBE.shape == cube.shape:
-                err = np.ascontiguousarray(ERROR_CUBE, dtype=np.float32)
-                err_shm = shared_memory.SharedMemory(create=True, size=int(err.nbytes))
-                err_arr = np.ndarray(err.shape, dtype=err.dtype, buffer=err_shm.buf)
-                err_arr[:] = err[:]
-                err_ctx = dict(err_shm_name=err_shm.name, err_shape=tuple(err.shape),
-                               err_dtype=str(err.dtype),
-                               sigma_label=noise_source_label())
+        def _progress(done, total_):
+            progress_bar.setValue(done)
+            status_label.setText(f"Fitting spaxel {done} / {total_}")
+            QApplication.processEvents()
 
-            # Lightweight stellar region specs (workers load/prepare the libs).
-            stellar_specs, stellar_mask = [], ()
-            if 'cont_type' in df_cont.columns:
-                for _, r in df_cont[df_cont['cont_type'] == 'stellar'].iterrows():
-                    stellar_specs.append(dict(
-                        rid=int(np.int64(r['region_ID'])),
-                        library=str(r['stellar_library']),
-                        fit_range=(float(r['x1']), float(r['x2'])),
-                        moments=int(r['stellar_moments']) if pd.notna(r.get('stellar_moments')) else 2))
-                if stellar_specs and len(df) > 0 and 'Centroid_0' in df.columns:
-                    stellar_mask = df['Centroid_0'].astype(float).to_numpy()
-
-            R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
-            R = 3000.0 if not np.isfinite(R) or R <= 0 else R
-
-            # Strip unpicklable matplotlib actor columns before shipping df/df_cont.
-            df_w = df.drop(columns=['curveactor'], errors='ignore').copy()
-            df_cont_w = df_cont.drop(columns=['lineactor'], errors='ignore').copy()
-
-            ctx = dict(
-                shm_name=shm.name, shape=tuple(cube.shape), dtype=str(cube.dtype),
-                wavelengths=np.asarray(wavelengths, float),
-                params_dumps=params.dumps(), n_regions=int(n_regions),
-                n_lines=int(n_lines), df=df_w, df_cont=df_cont_w, z=z, R=R,
-                sequential=bool(getattr(self, '_sequential_fit', False)),
-                max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask,
-                **err_ctx)
-
-            # Precompute RA/Dec for all gated spaxels (keeps WCS out of workers).
-            xs = np.array([ij[0] for ij in gated])
-            ys = np.array([ij[1] for ij in gated])
-            try:
-                ras, decs = self.viewer_window.pixel_to_ra_dec(xs, ys)
-                ras = np.atleast_1d(ras); decs = np.atleast_1d(decs)
-            except Exception:
-                ras = np.full(len(gated), np.nan); decs = np.full(len(gated), np.nan)
-            tasks = [(int(xs[k]), int(ys[k]), float(ras[k]), float(decs[k]))
-                     for k in range(len(gated))]
-
-            print(f"Parallel Fit Cube: {len(tasks)} spaxels across {n_workers} workers")
-            mpctx = mp.get_context('spawn')
-            _stellar_rows, done = [], 0
-            # Pin BLAS to 1 thread per worker so N workers don't oversubscribe the
-            # cores. Spawned children inherit the env (workers spawn lazily on the
-            # first submit), so keep it pinned for the whole pool lifetime and
-            # restore afterwards — setting it inside the worker is too late because
-            # numpy/OpenBLAS read it at import.
-            _thr_vars = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
-                         'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS')
-            _thr_saved = {k: os.environ.get(k) for k in _thr_vars}
-            for k in _thr_vars:
-                os.environ[k] = '1'
-            try:
-                ex = ProcessPoolExecutor(max_workers=n_workers, mp_context=mpctx,
-                                         initializer=HyperCube_fit._worker_init,
-                                         initargs=(ctx,))
-                try:
-                    futures = [ex.submit(HyperCube_fit._worker_fit_one, t) for t in tasks]
-                    for fut in as_completed(futures):
-                        if self._fit_cancelled:
-                            break
-                        try:
-                            line_rows, srows = fut.result()
-                        except Exception as e:
-                            print(f"worker task error: {type(e).__name__}: {e}")
-                            line_rows, srows = [], []
-                        fit_results.extend(line_rows)
-                        _stellar_rows.extend(srows)
-                        done += 1
-                        if done % 16 == 0 or done == len(tasks):
-                            progress_bar.setValue(done)
-                            status_label.setText(f"Fitting spaxel {done} / {total}")
-                            QApplication.processEvents()
-                finally:
-                    ex.shutdown(wait=not self._fit_cancelled, cancel_futures=True)
-            finally:
-                for k, v in _thr_saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
-            return _stellar_rows
-        finally:
-            for _shm in (shm, err_shm):
-                if _shm is None:
-                    continue
-                _shm.close()
-                try:
-                    _shm.unlink()
-                except FileNotFoundError:
-                    pass
+        err = ERROR_CUBE if (ERROR_CUBE is not None
+                             and ERROR_CUBE.shape == FITS_DATA.shape) else None
+        line_rows, _stellar_rows = HyperCube_fit.run_pool(
+            cube=FITS_DATA, wavelengths=wavelengths, params=params,
+            # Matplotlib artists are unpicklable; drop them before shipping.
+            df=df.drop(columns=['curveactor'], errors='ignore').copy(),
+            df_cont=df_cont.drop(columns=['lineactor'], errors='ignore').copy(),
+            z=z, R=resolving_power_for_templates(), gated=gated, radec=(ras, decs),
+            n_workers=n_workers, err_cube=err,
+            sigma_label=(noise_source_label() if err is not None else None),
+            sequential=bool(getattr(self, '_sequential_fit', False)),
+            max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask,
+            progress_cb=_progress, is_cancelled=lambda: self._fit_cancelled)
+        fit_results.extend(line_rows)
+        return _stellar_rows
 
     def _stellar_cube_prep(self):
         """Prepare a per-spaxel stellar fit across the cube. Returns a LIST of
@@ -10614,8 +11849,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             return []
         z = _safe_float(df_obs.loc[0, 'redshift']) if len(df_obs) else 0.0
         z = 0.0 if not np.isfinite(z) else z
-        R = _safe_float(df_obs.loc[0, 'resolvingpower']) if len(df_obs) else np.nan
-        R = 3000.0 if not np.isfinite(R) or R <= 0 else R
+        R = resolving_power_for_templates()
         mask = (df['Centroid_0'].astype(float).to_numpy()
                 if len(df) > 0 and 'Centroid_0' in df.columns else ())
         preps = []
@@ -10790,88 +12024,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             z = df_obs['redshift'].item()
 
-        params = Parameters()
-        for i, row in df_cont.iterrows():
-            region_id = row['region_ID']
-            params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
-            params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
-
-            _ctype = str(row['cont_type']) if ('cont_type' in df_cont.columns
-                                               and pd.notna(row['cont_type'])) else 'linear'
-            _kx = _as_float_list(row['knots_x']) if 'knots_x' in df_cont.columns else []
-            _ky = _as_float_list(row['knots_y_0']) if 'knots_y_0' in df_cont.columns else []
-            _pc = _as_float_list(row['poly_coef_0']) if 'poly_coef_0' in df_cont.columns else []
-            is_poly = (_ctype == 'poly' and len(_pc) >= 1)
-            is_spline = (_ctype == 'spline' and len(_kx) >= 2 and len(_kx) == len(_ky))
-            is_stellar = (_ctype == 'stellar')
-
-            slope = row['Slope_0'] if np.isfinite(row['Slope_0']) else 0
-            intercept = row['Intercept_0'] if np.isfinite(row['Intercept_0']) else 0
-            # Stellar continuum is a fixed baseline subtracted from the spectrum
-            # before the line fit, so its model continuum is held at zero.
-            if is_stellar:
-                slope = intercept = 0
-
-            params.add(f'slope{i + 1}', value=slope, vary=not (is_spline or is_poly or is_stellar))
-            params.add(f'intercept{i + 1}', value=intercept, vary=not (is_spline or is_poly or is_stellar))
-
-            if is_poly:
-                params.add(f'NP{i + 1}', value=len(_pc), vary=False)
-                for j in range(len(_pc)):
-                    params.add(f'polyc{i + 1}_{j}', value=float(_pc[j]), vary=True)
-            else:
-                params.add(f'NP{i + 1}', value=0, vary=False)
-
-            if is_spline:
-                ptp = (max(_ky) - min(_ky)) if len(_ky) > 1 else 0.0
-                _delta = 0.5 * ptp if ptp > 0 else max(abs(np.mean(_ky)), 1.0)
-                params.add(f'NK{i + 1}', value=len(_kx), vary=False)
-                for k in range(len(_kx)):
-                    params.add(f'knotx{i + 1}_{k}', value=float(_kx[k]), vary=False)
-                    params.add(f'knoty{i + 1}_{k}', value=float(_ky[k]), vary=True,
-                               min=float(_ky[k]) - _delta, max=float(_ky[k]) + _delta)
-            else:
-                params.add(f'NK{i + 1}', value=0, vary=False)
-
-            if i < len(df_cont) - 1:
-                next_row = df_cont.iloc[i + 1]
-                params.add(f'x_int_{i + 1}_start', value=row['x2'], vary=False)
-                params.add(f'x_int_{i + 1}_end', value=next_row['x1'], vary=False)
-                params.add(f'slope_int_{i + 1}', value=slope, vary=True)
-                params.add(f'intercept_int_{i + 1}', value=intercept, vary=True)
-
-            region_lines = df[df['region_ID'] == region_id]
-            for j, line in enumerate(df.itertuples(), start=1):
-                _amp   = np.float64(line.Amp_0)
-                _cen   = np.float64(line.Centroid_0)
-                _sigma = np.float64(line.Sigma_0)
-                _amp_lo  = np.float64(line.Amp_0_lowlim)   if np.isfinite(np.float64(line.Amp_0_lowlim))  else None
-                _amp_hi  = np.float64(line.Amp_0_highlim)  if np.isfinite(np.float64(line.Amp_0_highlim)) else None
-                _cen_lo  = np.float64(line.Centroid_0_lowlim)  if np.isfinite(np.float64(line.Centroid_0_lowlim))  else None
-                _cen_hi  = np.float64(line.Centroid_0_highlim) if np.isfinite(np.float64(line.Centroid_0_highlim)) else None
-                _sig_lo  = np.float64(line.Sigma_0_lowlim)  if np.isfinite(np.float64(line.Sigma_0_lowlim))  else None
-                _sig_hi  = np.float64(line.Sigma_0_highlim) if np.isfinite(np.float64(line.Sigma_0_highlim)) else None
-                if _amp == 0:
-                    _amp = 1e-30
-                params.add(f'amp{j}',   value=_amp,   vary=True, min=_amp_lo,  max=_amp_hi)
-                params.add(f'cen{j}',   value=_cen,   vary=True, min=_cen_lo,  max=_cen_hi)
-                params.add(f'sigma{j}', value=_sigma, vary=True, min=_sig_lo,  max=_sig_hi)
-
-                if df.iloc[j-1]['Rest Wavelength']:
-                    if type(df.iloc[j-1]['Rest Wavelength']) == str:
-                        rest_wavelength = ast.literal_eval(df.iloc[j-1]['Rest Wavelength'])
-                    else:
-                        rest_wavelength = df.iloc[j-1]['Rest Wavelength']
-                else:
-                    rest_wavelength = np.nan
-                if np.isfinite(rest_wavelength) and 'constraints' in df.columns:
-                    df = update_constraints_with_velocity(df, z)
-
-            params.add(f'NR{i + 1}', value=len(region_lines), vary=False)
-
-        Nregions = len(df_cont)
-        Nlines = len(np.unique(df['Line_ID']))
-        add_dataframe_constraints_to_params(df, params)
+        # Same builder as the cube path (HyperCube_fit.build_params) — these
+        # two were near-duplicates that had already drifted apart.
+        params, Nregions, Nlines, df = HyperCube_fit.build_params(
+            df, df_cont, z,
+            velocity_updater=update_constraints_with_velocity,
+            constraint_applier=add_dataframe_constraints_to_params)
         print(f'Nregions={Nregions}, Nlines={Nlines}')
         model_maker = HyperCube_ModelFunctions.PiecewiseModel(n_regions=Nregions, n_gaussians=Nlines)
         piecewise_model = Model(model_maker.model_function)
@@ -10938,11 +12096,16 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             vw._blue_rect.set_visible(False)
             vw.canvas.draw_idle()
 
+        # This spaxel's values changed, so any map on screen (and its colorbar)
+        # is now one spaxel out of date.
+        self.refresh_displayed_map()
+
         print(f"Fit complete for spaxel ({cx}, {cy}).")
 
 
     def fit_cube(self, refit=False, rchisq_thresh=None, qual_col=None, qual_op='>',
-                 bad_spaxels_override=None):
+                 bad_spaxels_override=None, criteria=None, seeds_k=3,
+                 radius_cap=3, max_passes=5, never_worse=True):
         global df, df_fit, fit_results, snr_mask, piecewise_model, line, new_results#,params
         global base_df_cont, base_df, spaxel_overrides, df_stellar
 
@@ -10985,124 +12148,14 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         else:
             z = df_obs['redshift'].item()
     
-        # Model parameters
-        params = Parameters()
-        
-        # Sort continuum regions by x1 (start wavelength)
-        df_cont_sort = df_cont.sort_values(by='x1').reset_index(drop=True)
-        
-        # Ensure lines are sorted by Centroid_0 within each region
-        df_sort = df.sort_values(by=['region_ID', 'Centroid_0']).reset_index(drop=True)
-    
-        # Loop through each continuum region and add parameters
-        for i, row in df_cont.iterrows():
-            region_id = row['region_ID']
-    
-            # Set x-limits for each region (fixed)
-            params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
-            params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
-
-            # Continuum: poly (Chebyshev coeffs free), spline (knot-Y free), or
-            # linear (slope/intercept free).
-            _ctype = str(row['cont_type']) if ('cont_type' in df_cont.columns
-                                               and pd.notna(row['cont_type'])) else 'linear'
-            _kx = _as_float_list(row['knots_x']) if 'knots_x' in df_cont.columns else []
-            _ky = _as_float_list(row['knots_y_0']) if 'knots_y_0' in df_cont.columns else []
-            _pc = _as_float_list(row['poly_coef_0']) if 'poly_coef_0' in df_cont.columns else []
-            is_poly = (_ctype == 'poly' and len(_pc) >= 1)
-            is_spline = (_ctype == 'spline' and len(_kx) >= 2 and len(_kx) == len(_ky))
-
-            # Linear continuum parameters (also added for spline/poly regions so
-            # the existing result-extraction code finds them; held fixed & unused
-            # by the model when this region is a spline or polynomial).
-            slope = row['Slope_0'] if np.isfinite(row['Slope_0']) else 0
-            intercept = row['Intercept_0'] if np.isfinite(row['Intercept_0']) else 0
-
-            params.add(f'slope{i + 1}', value=slope, vary=not (is_spline or is_poly))
-            params.add(f'intercept{i + 1}', value=intercept, vary=not (is_spline or is_poly))
-
-            if is_poly:
-                # NP signals the model to use a Chebyshev polynomial for this
-                # region; the coefficients are free, seeded from the initial fit.
-                params.add(f'NP{i + 1}', value=len(_pc), vary=False)
-                for j in range(len(_pc)):
-                    params.add(f'polyc{i + 1}_{j}', value=float(_pc[j]), vary=True)
-            else:
-                params.add(f'NP{i + 1}', value=0, vary=False)
-
-            if is_spline:
-                # Knot count (signals the model to use a spline for this region),
-                # fixed knot-x, and free knot-y seeded from the user's clicks.
-                # Bound each knot-y to init ± 0.5·(peak-to-peak of the knots) to
-                # curb the spline from absorbing emission lines.
-                ptp = (max(_ky) - min(_ky)) if len(_ky) > 1 else 0.0
-                _delta = 0.5 * ptp if ptp > 0 else max(abs(np.mean(_ky)), 1.0)
-                params.add(f'NK{i + 1}', value=len(_kx), vary=False)
-                for k in range(len(_kx)):
-                    params.add(f'knotx{i + 1}_{k}', value=float(_kx[k]), vary=False)
-                    params.add(f'knoty{i + 1}_{k}', value=float(_ky[k]), vary=True,
-                               min=float(_ky[k]) - _delta, max=float(_ky[k]) + _delta)
-            else:
-                params.add(f'NK{i + 1}', value=0, vary=False)
-
-            # Add parameters for the linear region between this and the next region
-            if i < len(df_cont) - 1:
-                next_row = df_cont.iloc[i + 1]
-                params.add(f'x_int_{i + 1}_start', value=row['x2'], vary=False)
-                params.add(f'x_int_{i + 1}_end', value=next_row['x1'], vary=False)
-    
-                params.add(f'slope_int_{i + 1}', value=slope, vary=True)
-                params.add(f'intercept_int_{i + 1}', value=intercept, vary=True)
-    
-            # Extract Gaussians associated with this region
-            region_lines = df[df['region_ID'] == region_id]
-    
-            # Add Gaussian parameters for this region
-            for j, line in enumerate(df.itertuples(), start=1):
-                # Cast all parameter values to float64 explicitly.
-                # After pd.concat operations, columns can be object dtype;
-                # lmfit silently misbehaves when given non-float initial values.
-                _amp   = np.float64(line.Amp_0)
-                _cen   = np.float64(line.Centroid_0)
-                _sigma = np.float64(line.Sigma_0)
-                _amp_lo  = np.float64(line.Amp_0_lowlim)   if np.isfinite(np.float64(line.Amp_0_lowlim))  else None
-                _amp_hi  = np.float64(line.Amp_0_highlim)  if np.isfinite(np.float64(line.Amp_0_highlim)) else None
-                _cen_lo  = np.float64(line.Centroid_0_lowlim)  if np.isfinite(np.float64(line.Centroid_0_lowlim))  else None
-                _cen_hi  = np.float64(line.Centroid_0_highlim) if np.isfinite(np.float64(line.Centroid_0_highlim)) else None
-                _sig_lo  = np.float64(line.Sigma_0_lowlim)  if np.isfinite(np.float64(line.Sigma_0_lowlim))  else None
-                _sig_hi  = np.float64(line.Sigma_0_highlim) if np.isfinite(np.float64(line.Sigma_0_highlim)) else None
-                # Guard: if initial value is exactly 0, use a small non-zero starting point
-                # so the optimizer has something to scale against
-                if _amp == 0:
-                    _amp = 1e-30
-                params.add(f'amp{j}',   value=_amp,   vary=True, min=_amp_lo,  max=_amp_hi)
-                params.add(f'cen{j}',   value=_cen,   vary=True, min=_cen_lo,  max=_cen_hi)
-                params.add(f'sigma{j}', value=_sigma, vary=True, min=_sig_lo,  max=_sig_hi)
-                
-                
-                # Add velocity parameter for this line
-                if df.iloc[j-1]['Rest Wavelength']:
-                    if type(df.iloc[j-1]['Rest Wavelength']) == str:
-                        rest_wavelength = ast.literal_eval(df.iloc[j-1]['Rest Wavelength'])
-                    else:
-                        rest_wavelength = df.iloc[j-1]['Rest Wavelength']
-                    
-                else:
-                    rest_wavelength = np.nan
-                
-                if (np.isfinite(rest_wavelength)) & ('constraints' in df.columns):
-                    # Update constraints in df
-                    df = update_constraints_with_velocity(df, z)
-    
-            # Add a "fake" parameter to store the number of Gaussians in this region
-            params.add(f'NR{i + 1}', value=len(region_lines), vary=False)
-    
-        # choose the model based on parameters
-        Nregions = len(df_cont)
-        Nlines = len(np.unique(df['Line_ID']))
-        
-        # parameter constraints 
-        add_dataframe_constraints_to_params(df, params)
+        # Model parameters. The builder lives in the Qt-free kernel so the GUI,
+        # the single-spaxel path and the headless runner share one
+        # implementation; the two constraint translators are injected because
+        # they live here, in the Qt module.
+        params, Nregions, Nlines, df = HyperCube_fit.build_params(
+            df, df_cont, z,
+            velocity_updater=update_constraints_with_velocity,
+            constraint_applier=add_dataframe_constraints_to_params)
     
         # print("\nParameters with Constraints:")
         # params.pretty_print()
@@ -11127,38 +12180,37 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                                         or rchisq_thresh is not None):
             fit_results = []
 
-            # Goodness-of-fit column used for (a) ranking neighbours when
-            # seeding and (b) deciding whether a re-fit candidate is acceptable.
-            # Always a genuine quality metric, independent of how spaxels were
-            # flagged for re-fitting.
-            _accept_col = ('qa_core_cont_ratio' if 'qa_core_cont_ratio' in df_fit.columns
-                           else 'rchisq')
-            _accept_thr = self._RECTIFY_DEFAULTS.get(_accept_col, 2.0)
-            _per = df_fit.drop_duplicates(subset=['spaxel_x', 'spaxel_y'])
-            qual = {}
-            for _, rr in _per.iterrows():
-                try:
-                    sx, sy = int(rr['spaxel_x']), int(rr['spaxel_y'])
-                except (TypeError, ValueError):
-                    continue
-                qual[(sx, sy)] = _safe_float(rr.get(_accept_col))
-
-            def _is_bad(v):
-                # Candidate-acceptance quality check (higher = worse).
-                return (not np.isfinite(v)) or (v > _accept_thr)
+            # Goodness is a QUALITY judgement, made independently of how spaxels
+            # were flagged for repair. This is the crux of the pass: a donor has
+            # to be *good*, not merely un-flagged. Previously `good_set` was
+            # "everything the user's filter did not catch", so a neighbour with a
+            # terrible core/continuum ratio was an eligible seed as long as the
+            # flagging criterion happened to miss it.
+            if criteria is None:
+                criteria = hcq.default_criteria()
+            _qmap = hcq.score_map(df_fit, criteria)          # {(x,y): (good, score)}
+            spx_score = {xy: sc for xy, (_g, sc) in _qmap.items()}
+            quality_good = {xy for xy, (g, _s) in _qmap.items() if g}
+            print(f"Rectify: goodness = {hcq.summarise(criteria)}")
 
             if bad_spaxels_override is not None:
-                # Explicit flagged set from the dialog. Good = fitted & not flagged.
+                # Explicit flagged set from the dialog: the spaxels to repair.
+                # Donors are still gated on quality, so a flagged-but-good spaxel
+                # is repaired yet may also seed others, and an unflagged-but-bad
+                # one is left alone yet never seeds anything.
                 bad_set = {(int(x), int(y)) for (x, y) in bad_spaxels_override}
-                good_set = {xy for xy in qual if xy not in bad_set}
+                good_set = quality_good - bad_set
                 bad_spaxels = pd.DataFrame(sorted(bad_set),
                                            columns=['spaxel_x', 'spaxel_y'])
-                print(f"Rectify: {len(bad_spaxels)} flagged / {len(qual)} fitted "
-                      f"spaxels (custom selection)")
+                print(f"Rectify: {len(bad_spaxels)} flagged / {len(_qmap)} fitted "
+                      f"spaxels (custom selection), {len(good_set)} usable as seeds")
             else:
-                # Legacy: flag on a single column / operator / threshold.
+                # Flag on a single column / operator / threshold (kept for
+                # callers that pass rchisq_thresh directly rather than a
+                # pre-computed flagged set).
                 _flag_col = (qual_col if (qual_col is not None and qual_col in df_fit.columns)
-                             else _accept_col)
+                             else 'qa_core_cont_ratio')
+                _per = df_fit.drop_duplicates(subset=['spaxel_x', 'spaxel_y'])
                 flag = {}
                 for _, rr in _per.iterrows():
                     try:
@@ -11176,70 +12228,203 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                         return abs(v) > rchisq_thresh
                     return v > rchisq_thresh  # default: '>'
 
-                good_set = {xy for xy, v in flag.items() if not _flag_bad(v)}
-                bad_spaxels = pd.DataFrame(
-                    sorted(xy for xy, v in flag.items() if _flag_bad(v)),
-                    columns=['spaxel_x', 'spaxel_y'])
+                bad_set = {xy for xy, v in flag.items() if _flag_bad(v)}
+                good_set = quality_good - bad_set
+                bad_spaxels = pd.DataFrame(sorted(bad_set),
+                                           columns=['spaxel_x', 'spaxel_y'])
                 _op_str = {'<-': f'< -{rchisq_thresh}',
                            'abs>': f'|·|> {rchisq_thresh}'}.get(
                     qual_op, f'> {rchisq_thresh}')
                 print(f"Rectify: {len(bad_spaxels)} bad / {len(flag)} fitted spaxels "
-                      f"({_flag_col} {_op_str})")
+                      f"({_flag_col} {_op_str}), {len(good_set)} usable as seeds")
 
-            def _best_neighbour(i, j):
-                """Best (lowest-quality-value) good spaxel among the 8 neighbours."""
-                best, best_q = None, np.inf
-                for di in (-1, 0, 1):
-                    for dj in (-1, 0, 1):
-                        if di == 0 and dj == 0:
-                            continue
-                        nb = (i + di, j + dj)
-                        if nb in good_set and qual[nb] < best_q:
-                            best, best_q = nb, qual[nb]
-                return best
+            # Rows committed so far, keyed by spaxel, so a later pass can replace
+            # what an earlier pass wrote rather than appending a second copy.
+            committed = {}
+            # Live view of the cube's quality: repairs land here immediately, so
+            # a spaxel fixed in this pass can seed its neighbours in the next one
+            # (and, because `pending` is consulted below, later in this one).
+            live_good = set(good_set)
+            live_score = dict(spx_score)
 
-            # Refit each bad spaxel: seed from its best good neighbour (spatial
-            # smoothness prior); if that still fails, fall back to targeted
-            # multi-start (Phase C). Only the best-scoring candidate is kept.
-            n_rescued = 0
-            for i, j in bad_spaxels.itertuples(index=False):
-                if snr_map[j, i] >= snr_value:
+            def _rows_for(xy):
+                """This spaxel's current best rows, as a frame.
+
+                Must consult `committed` first: df_fit is only merged after every
+                pass, so a spaxel repaired earlier in this run still carries its
+                OLD (bad) values there. Seeding from df_fit alone would hand a
+                donor's pre-repair parameters to its neighbour and quietly
+                undo the propagation.
+                """
+                got = committed.get(xy)
+                if got:
+                    return pd.DataFrame(got)
+                return df_fit[(df_fit['spaxel_x'] == xy[0]) &
+                              (df_fit['spaxel_y'] == xy[1])]
+
+            self._fit_cancelled = False
+            todo = [(int(i), int(j)) for i, j in bad_spaxels.itertuples(index=False)
+                    if snr_map[j, i] >= snr_value]
+            n_skipped = len(bad_spaxels) - len(todo)
+            total_fits = 0
+            _t0 = time.perf_counter()
+
+            for _pass in range(1, max(1, int(max_passes)) + 1):
+                if not todo:
+                    break
+                # Flood-fill order: spaxels with the most good neighbours first,
+                # so repairs spread inward from the rim of a bad patch rather
+                # than in raster order. Ties broken by current score (best first).
+                todo.sort(key=lambda xy: (
+                    -len(self._good_donors(xy[0], xy[1], live_good, live_score,
+                                           radius_cap=1, k=8)[0]),
+                    live_score.get(xy, np.inf)))
+
+                still_bad, n_rescued, n_improved = [], 0, 0
+                for n_done, (i, j) in enumerate(todo, start=1):
+                    if self._fit_cancelled:
+                        # Stop here, but keep what has already been repaired:
+                        # every committed spaxel is a finished, better fit, and
+                        # discarding them would punish the user for stopping.
+                        still_bad.extend(todo[n_done - 1:])
+                        break
                     self.viewer_window.current_spaxel = (i, j)
-                    nb = _best_neighbour(i, j)
-                    if nb is not None:
-                        nb_rows = df_fit[(df_fit['spaxel_x'] == nb[0]) &
-                                         (df_fit['spaxel_y'] == nb[1])]
-                        seed = self._params_from_fit_row(params, nb_rows)
-                    else:
-                        seed = params.copy()  # no good neighbour → base init
 
-                    # Incumbent: neighbour-seeded (or base) fit.
-                    best_ratio, best_rows = self._fit_candidate(z, seed)
+                    # Candidate 0 — the incumbent, scored from the fit this
+                    # spaxel already has. Costs nothing (no re-fit) and acts as
+                    # the floor: with never_worse, Rectify cannot degrade a
+                    # spaxel, which is what makes iterating safe.
+                    inc_rows = committed.get((i, j))
+                    if inc_rows is None:
+                        inc_rows = df_fit[(df_fit['spaxel_x'] == i) &
+                                          (df_fit['spaxel_y'] == j)].to_dict('records')
+                    # (committed rows are already dicts; df_fit slice converted above)
+                    best_score = (hcq.score(inc_rows[0], criteria) if inc_rows else np.inf)
+                    best_rows, best_seed = (inc_rows if never_worse else None), 'incumbent'
+                    was_score = best_score
 
-                    # Targeted multi-start only if the incumbent is still bad.
-                    if _is_bad(best_ratio):
-                        for _label, cand in self._targeted_restarts(seed):
-                            c_ratio, c_rows = self._fit_candidate(z, cand)
-                            if c_ratio < best_ratio:
-                                best_ratio, best_rows = c_ratio, c_rows
+                    donors, radius = self._good_donors(i, j, live_good, live_score,
+                                                       radius_cap=radius_cap, k=seeds_k)
+                    # Every good neighbour is a free, physically-plausible restart.
+                    # Try them best-first and stop at the first that lands a good
+                    # fit — that early exit is what keeps the common case at the
+                    # one fit per spaxel this cost before.
+                    tried_any = False
+                    for nb in donors:
+                        seed = self._params_from_fit_row(params, _rows_for(nb))
+                        c_score, c_good, c_rows = self._fit_candidate(z, seed, criteria)
+                        total_fits += 1
+                        tried_any = True
+                        if c_rows and c_score < best_score:
+                            best_score, best_rows = c_score, c_rows
+                            best_seed = f'neighbour({nb[0]},{nb[1]})@r{radius}'
+                        if c_good:
+                            break
 
-                    fit_results.extend(best_rows)
-                    if not _is_bad(best_ratio):
+                    if not tried_any:
+                        # No good spaxel within radius_cap — fall back to the
+                        # model's own initial guesses, as before.
+                        c_score, c_good, c_rows = self._fit_candidate(
+                            z, params.copy(), criteria)
+                        total_fits += 1
+                        if c_rows and c_score < best_score:
+                            best_score, best_rows, best_seed = c_score, c_rows, 'base'
+
+                    # Targeted multi-start only once every neighbour seed failed.
+                    _best_good = bool(best_rows) and hcq.is_good(best_rows[0], criteria)
+                    if not _best_good:
+                        _base = (self._params_from_fit_row(params, _rows_for(donors[0]))
+                                 if donors else params.copy())
+                        for _label, cand in self._targeted_restarts(_base):
+                            c_score, c_good, c_rows = self._fit_candidate(z, cand, criteria)
+                            total_fits += 1
+                            if c_rows and c_score < best_score:
+                                best_score, best_rows = c_score, c_rows
+                                best_seed = f'restart:{_label}'
+                            if c_good:
+                                break
+
+                    if best_rows:
+                        for _r in best_rows:
+                            _r['rectify_pass'] = (0 if best_seed == 'incumbent' else _pass)
+                            _r['rectify_seed'] = best_seed
+                            _r['rectify_score'] = (float(best_score)
+                                                   if np.isfinite(best_score) else np.nan)
+                        committed[(i, j)] = best_rows
+                        live_score[(i, j)] = best_score
+                        if best_seed != 'incumbent' and best_score < was_score:
+                            n_improved += 1
+
+                    # Goodness is the AND-gate over the criteria, NOT the mean
+                    # score: a spaxel that fails one metric but averages below 1
+                    # must never be admitted to `live_good`, or it would seed its
+                    # neighbours from a fit the criteria reject.
+                    if best_rows and hcq.is_good(best_rows[0], criteria):
                         n_rescued += 1
+                        live_good.add((i, j))     # now usable as a donor
+                    else:
+                        still_bad.append((i, j))
 
-                    current_spaxel = i * ny + j + 1
-                    progress_bar.setValue(current_spaxel)
-                    status_label.setText(f"Rectifying spaxel ({i}, {j})")
+                    progress_bar.setValue(min(int(progress_bar.maximum()),
+                                              int(n_done * nx * ny / max(1, len(todo)))))
+                    status_label.setText(
+                        f"Rectify pass {_pass}: spaxel ({i}, {j})")
                     QApplication.processEvents()
 
-                    if current_spaxel % 500 == 0 and psutil.virtual_memory().percent > 80:
+                    if n_done % 500 == 0 and psutil.virtual_memory().percent > 80:
                         gc.collect()
 
-            print(f"Rectify: {n_rescued}/{len(bad_spaxels)} spaxels now below threshold")
+                print(f"Rectify pass {_pass}/{max_passes}: {n_rescued} rescued, "
+                      f"{n_improved} improved, {len(still_bad)} still bad")
+
+                # Show this pass's result before starting the next one, so the
+                # map fills in live instead of jumping once at the very end.
+                # df_fit is only merged after all passes, so splice this pass's
+                # rows into a temporary view for the redraw.
+                if committed:
+                    _saved = df_fit
+                    try:
+                        _new = pd.DataFrame([r for rows in committed.values()
+                                             for r in rows])
+                        _keep = _saved.merge(
+                            _new[['spaxel_x', 'spaxel_y', 'LineID']],
+                            on=['spaxel_x', 'spaxel_y', 'LineID'], how='left',
+                            indicator=True).query('_merge == "left_only"').drop(
+                            columns='_merge')
+                        df_fit = pd.concat([_keep, _new], ignore_index=True)
+                        self.refresh_displayed_map()
+                        QApplication.processEvents()
+                    except Exception as e:
+                        print(f'Rectify: interim map refresh skipped ({e})')
+                    finally:
+                        df_fit = _saved
+
+                todo = still_bad
+                # A pass that rescued nothing cannot do better next time: the
+                # good set it would draw on is unchanged.
+                if n_rescued == 0 or self._fit_cancelled:
+                    break
+
+            for _rows in committed.values():
+                fit_results.extend(_rows)
+            _n_bad0 = len(bad_spaxels) - n_skipped
+            print(f"Rectify: {_n_bad0 - len(todo)}/{_n_bad0} spaxels now good "
+                  f"({total_fits} fits, {time.perf_counter() - _t0:.1f} s"
+                  + (f", {n_skipped} skipped below SNR" if n_skipped else "")
+                  + (" — CANCELLED, repairs so far were kept"
+                     if self._fit_cancelled else "") + ")")
+
+            # Nothing was re-fit (every flagged spaxel sat below the SNR gate):
+            # leave df_fit exactly as it was rather than merging an empty frame.
+            if not fit_results:
+                print('Rectify: nothing to merge — df_fit unchanged.')
+                self.viewer_window.current_spaxel = _locked_spaxel
+                self.fit_progress_frame.setVisible(False)
+                return
 
             # Merge results (keeping LineID matching)
             new_results = pd.DataFrame(fit_results)
-            
+
             # First, drop the rows from df_fit that match the rows in df_new (on the three columns)
             df_fit_filtered = df_fit.merge(
                 new_results[['spaxel_x', 'spaxel_y', 'LineID']],
@@ -11352,9 +12537,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             vw._blue_rect.set_visible(False)
             vw.canvas.draw_idle()
 
+        # Any fit map on screen is now stale — re-render it from the new df_fit.
+        self.refresh_displayed_map()
+
         print("Fitting complete for entire cube.")
 
-        
 
     def add_spectral_frame(self, title_text, df_cont, df, ID, addframe):
         """Creates a spectral region frame and appends it vertically to the scroll area.
@@ -11432,12 +12619,25 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         grid_layout.setContentsMargins(4, 4, 4, 4)
         frame_layout.addLayout(grid_layout)
 
+        n_cols = 17          # width of the line rows, and so of the whole grid
+
         self.add_continuum_buttons(ID, grid_layout)
+        # Continuum cells are far fewer than the line rows' 17 columns; spread
+        # them over the spare ones so the row fills the frame instead of
+        # bunching up on the left. The header row reuses the button row's
+        # spans so labels stay over their own cells.
+        _cont_spans = self._spread_grid_row(grid_layout, 1, n_cols)
+        if _cont_spans:
+            # Only follow the buttons. Left to compute its own spans the header
+            # would lay out independently — it has one cell fewer, having no
+            # label over the delete button — and the labels would drift off the
+            # cells they name.
+            self._spread_grid_row(grid_layout, 0, n_cols, spans=_cont_spans)
+
         self.add_spectral_lines_button_header(grid_layout)
         self.add_spectral_lines(ID, grid_layout)
 
         # Equal stretch on every column so content fills the frame width
-        n_cols = 17
         for col in range(n_cols):
             grid_layout.setColumnStretch(col, 1)
             grid_layout.setColumnMinimumWidth(col, 0)
@@ -11470,6 +12670,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             self.source_name_button.setText(f"Source: {df_obs.loc[0, 'sourcename']}")
             self.source_redshift_button.setText(f"z: {df_obs.loc[0, 'redshift']}")
             self.resolving_power_button.setText(f"R: {df_obs.loc[0, 'resolvingpower']}")
+            if 'resolvingpower' in button_name:
+                # Typed by hand: the derived provenance no longer describes it.
+                global R_PROVENANCE
+                R_PROVENANCE = ''
+                self.resolving_power_button.setToolTip(
+                    'Resolving power R (entered by hand)')
         else:
         
             if (frame_id, button_name) in self.buttons_dict:
@@ -11996,10 +13202,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 string = _fmt(sigma_wl_to_kms(_raw, _cen0))
             else:
                 string = str(_raw)
-            text_box = QLineEdit()
-            text_box.setText(string)  # Set the initial value from the dataframe
-            text_box.setGeometry(200, 200, 100, 30)
-            text_box.show()
+            text_box = self._popup_editor(frame_id, button_name, string)
             # # # # Connect the returnPressed signal to handle text submission
             text_box.returnPressed.connect(lambda: self.on_submit(text_box, data_frame, frame_id, button_name, button_type='param_limit'))
         
@@ -12010,10 +13213,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     self._show_source_dialog()
                 else:
                     string = df_obs[button_name].item()
-                    text_box = QLineEdit()
-                    text_box.setText(string)
-                    text_box.setGeometry(200, 200, 100, 30)
-                    text_box.show()
+                    text_box = self._popup_editor(frame_id, button_name, string)
                     text_box.returnPressed.connect(lambda: self.on_submit(text_box, data_frame, frame_id, button_name, button_type='obs_button'))
             else:
             
@@ -12051,6 +13251,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 cancel_btn = QPushButton('Cancel'); cancel_btn.clicked.connect(dialog.reject)
                 btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
                 layout.addLayout(btn_row)
+                self._place_at_button(dialog, frame_id, button_name)
                 dialog.exec_()
 
             if button_name.split('~')[0] == 'stellar':
@@ -12070,6 +13271,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 cancel_btn = QPushButton('Cancel'); cancel_btn.clicked.connect(dialog.reject)
                 btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
                 layout.addLayout(btn_row)
+                self._place_at_button(dialog, frame_id, button_name)
                 dialog.exec_()
 
             if any(p in button_name for p in ['Centroid_0', 'Amp_0', 'Sigma_0']):
@@ -12103,12 +13305,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 btn_row.addWidget(ok_btn)
                 btn_row.addWidget(cancel_btn)
                 layout.addLayout(btn_row)
+                self._place_at_button(dialog, frame_id, button_name)
                 dialog.exec_()
 
             if 'Rest Wavelength' in button_name:
-                text_box = QLineEdit()
-                # text_box.setText('')  # Set the initial value from the dataframe
-                text_box.show()
+                text_box = self._popup_editor(frame_id, button_name)
                 text_box.returnPressed.connect(lambda: self.on_submit(text_box, data_frame, frame_id, button_name, button_type='RestWavelength'))
     
             if 'Line_Name' in button_name:
@@ -12257,8 +13458,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     'Assign lines to the same K-group to tie their velocity AND '
                     'velocity dispersion together during fitting — they share '
                     'one kinematic solution (equal velocity and equal km/s '
-                    'dispersion). The first line in the group (model order) is '
-                    'the reference; the others are tied to it.\n\n'
+                    'dispersion). One member is the reference: its velocity and '
+                    'dispersion stay free and the others are tied to it. A group '
+                    'anchors on its first line in model order until you press '
+                    '"Make this line the reference for its K-group", which moves '
+                    'the anchor to the line whose constraints you are editing — '
+                    'usually the best-measured line, not the bluest.\n\n'
                     'Select at most one group per line. Click the active box '
                     'again to remove this line from its group.'))
                 kgroup_header.addWidget(kgroup_help)
@@ -12281,11 +13486,37 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 kgroup_ref_label.setStyleSheet(f'color: gray; {ui_font_css("small")}')
                 layout.addWidget(kgroup_ref_label)
 
+                # Promote this line to its group's anchor. A group otherwise
+                # anchors on whichever member happens to come first in model
+                # order, which is rarely the line you would choose — the
+                # reference is the one whose velocity and dispersion stay free,
+                # so it wants to be the best-measured line in the group, not the
+                # bluest. Applies the pending group selection first, so it does
+                # the obvious thing whether or not Submit has been pressed.
+                kgroup_ref_btn = QPushButton(
+                    'Make this line the reference for its K-group', dialog,
+                    default=False, autoDefault=False)
+                layout.addWidget(kgroup_ref_btn)
+
+                def _promote_to_reference():
+                    sel = next((lbl for lbl, box in kgroup_checkboxes.items()
+                                if box.isChecked()), '')
+                    if not sel:
+                        return
+                    self._save_line_kgroup(linename, sel)
+                    self._set_kgroup_reference(linename)
+                    _refresh_kgroup_label()
+
+                kgroup_ref_btn.clicked.connect(_promote_to_reference)
+
                 def _refresh_kgroup_label():
                     sel = next((lbl for lbl, box in kgroup_checkboxes.items()
                                 if box.isChecked()), '')
                     if not sel:
                         kgroup_ref_label.setText('')
+                        kgroup_ref_btn.setEnabled(False)
+                        kgroup_ref_btn.setToolTip(
+                            'Assign this line to a K-group first.')
                         return
                     # Would-be members of `sel` in model order, treating this
                     # line's pending selection as authoritative.
@@ -12297,13 +13528,27 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     if len(members) < 2:
                         kgroup_ref_label.setText(
                             f'{sel}: add another line to this group to form a tie.')
-                    elif members[0] == linename:
+                        kgroup_ref_btn.setEnabled(False)
+                        kgroup_ref_btn.setToolTip(
+                            'A group needs a second line before it has a '
+                            'reference to hold.')
+                        return
+                    ref = self._kgroup_reference(sel, members) or members[0]
+                    if ref == linename:
                         kgroup_ref_label.setText(
                             f'This line is the {sel} reference — it holds the '
                             f"group's free velocity & dispersion.")
+                        kgroup_ref_btn.setEnabled(False)
+                        kgroup_ref_btn.setToolTip(
+                            'This line already anchors its group.')
                     else:
                         kgroup_ref_label.setText(
-                            f'Tied to {sel} reference: {members[0]}.')
+                            f'Tied to {sel} reference: {ref}.')
+                        kgroup_ref_btn.setEnabled(True)
+                        kgroup_ref_btn.setToolTip(
+                            f'Move the {sel} anchor from {ref} to {linename}: '
+                            f"{linename}'s velocity and dispersion become the "
+                            f'free ones, and the rest of the group ties to them.')
 
                 # Enforce mutual exclusivity (radio-like, but each is clearable)
                 def _make_kgroup_handler(active_label):
@@ -12348,9 +13593,22 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 new_width = int(current_width * 2)  # 10% wider
                 dialog.resize(350, 100)
     
-                # Connect returnPressed for text_box (normal behavior)
-                text_box.returnPressed.connect(lambda: [self.on_submit(text_box, data_frame, frame_id, button_name, button_type='line_name'), on_input_confirmed()])
-    
+                # (returnPressed is connected once, where text_box is created —
+                # an identical second connect used to live here, so Return ran
+                # the submit twice: the second pass tried to remove a matplotlib
+                # actor the first had already removed.)
+
+                # Return in the name field must submit the name and nothing
+                # else. Qt makes every QPushButton in a dialog an autoDefault
+                # button, so Return also fired the first one in tab order — the
+                # constraint-syntax '?' — and its help window opened on top of
+                # the submit. Clearing the flag on the whole dialog covers the
+                # buttons added later too, rather than relying on each one to
+                # remember; nothing here wants to be the default button.
+                for _btn in dialog.findChildren(QPushButton):
+                    _btn.setAutoDefault(False)
+                    _btn.setDefault(False)
+
                 # Show the dialog
                 dialog.exec_()
 
@@ -12679,21 +13937,65 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 return v
         return ''
 
-    def _kgroup_reference(self, group_label):
-        """The reference (anchor) line of a K-group: first member in model order.
+    @staticmethod
+    def _truthy_flag(v):
+        """Is a stored flag set? Tolerates the spellings a round-trip produces."""
+        return str(v).strip().lower() not in ('', 'nan', 'none', 'false', '0')
 
-        Returns None for a group with fewer than two members (no tie yet).
+    def _is_kgroup_reference(self, line_name):
+        """True if this line was explicitly promoted to its group's anchor."""
+        if 'kgroup_ref' not in df.columns:
+            return False
+        return any(self._truthy_flag(v)
+                   for v in df.loc[df['Line_Name'] == line_name, 'kgroup_ref'])
+
+    def _kgroup_reference(self, group_label, members=None):
+        """The reference (anchor) line of a K-group.
+
+        The member the user promoted, if one still belongs to the group;
+        otherwise the first in model order, which is what a group anchors on
+        until somebody chooses. Returns None for a group with fewer than two
+        members (no tie yet). `members` overrides the saved membership, so a
+        dialog can ask what a group *would* anchor on given a pending change.
         """
-        members = [n for n in self._unique_line_names()
-                   if self._kgroup_of(n) == group_label]
-        return members[0] if len(members) >= 2 else None
+        if members is None:
+            members = [n for n in self._unique_line_names()
+                       if self._kgroup_of(n) == group_label]
+        if len(members) < 2:
+            return None
+        promoted = [n for n in members if self._is_kgroup_reference(n)]
+        return promoted[0] if promoted else members[0]
+
+    def _set_kgroup_reference(self, line_name):
+        """Promote `line_name` to the anchor of its own K-group.
+
+        Every other member is tied to whichever line holds this flag, so exactly
+        one may carry it: setting it here clears it across the rest of the group
+        and rebuilds the ties so they point at the new anchor.
+        """
+        global df
+        group = self._kgroup_of(line_name)
+        if not group:
+            return False
+        if 'kgroup_ref' not in df.columns:
+            df['kgroup_ref'] = [False] * len(df)
+        for n in self._unique_line_names():
+            if self._kgroup_of(n) == group:
+                df.loc[df['Line_Name'] == n, 'kgroup_ref'] = (n == line_name)
+        self._sync_kgroup_constraints()
+        return True
 
     def _save_line_kgroup(self, line_name, group):
         """Persist a line's K-group ('' clears it) and refresh kinematic ties."""
         global df
         if 'kgroup' not in df.columns:
             df['kgroup'] = ['' for _ in range(len(df))]
+        previous = self._kgroup_of(line_name)
         df.loc[df['Line_Name'] == line_name, 'kgroup'] = group
+        if group != previous and 'kgroup_ref' in df.columns:
+            # A promotion belongs to the group it was made in; moving the line
+            # (or dropping it out) cannot carry the anchor role along with it.
+            df.loc[df['Line_Name'] == line_name, 'kgroup_ref'] = False
         if not group:
             # A line just removed from its group is no longer rebuilt by the
             # sync below (which only touches grouped lines), so clear its ties now.
@@ -12703,10 +14005,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
     def _sync_kgroup_constraints(self):
         """Materialize velocity + dispersion ties from K-group membership.
 
-        Within each group the first line (model order) is the reference anchor;
-        every other member gets ``vel == vel_[reference]`` and a matching
-        velocity-dispersion tie. Lines with no K-group are left untouched so
-        manual constraints are preserved.
+        Within each group one line is the reference anchor — the promoted
+        member, else the first in model order — and every other member gets
+        ``vel == vel_[reference]`` and a matching velocity-dispersion tie. Lines
+        with no K-group are left untouched so manual constraints are preserved.
         """
         if 'kgroup' not in df.columns:
             return
@@ -12717,12 +14019,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         # Clear ties on all currently grouped lines, then rebuild.
         for n in grouped:
             self._clear_kgroup_ties(n)
-        for members in groups.values():
+        for label, members in groups.items():
             if len(members) < 2:
                 continue
-            ref = members[0]
-            for m in members[1:]:
-                self._set_kgroup_ties(m, ref)
+            ref = self._kgroup_reference(label, members) or members[0]
+            for m in members:
+                if m != ref:
+                    self._set_kgroup_ties(m, ref)
 
     def _line_overlay_color(self, line_id):
         """SVG color used for this line's component curve in the spectrum view.
@@ -12741,6 +14044,63 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         except (ValueError, KeyError, TypeError):
             return None
         return svg_colors[idx % len(svg_colors)]
+
+    def _place_at_button(self, widget, frame_id, button_name, dy=0):
+        """Move a popup/dialog so it opens at the button that was clicked
+        rather than centred on the panel (or at the top-left of the screen),
+        clamped to stay fully on the screen it lands on."""
+        widget.adjustSize()
+        btn = self.buttons_dict.get((frame_id, button_name))
+        pos = (btn.mapToGlobal(btn.rect().topLeft())
+               if (btn is not None and btn.isVisible()) else QCursor.pos())
+        pos.setY(pos.y() + dy)
+        scr = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        if scr is not None:
+            g = scr.availableGeometry()
+            pos.setX(min(max(pos.x(), g.left()), max(g.left(), g.right() + 1 - widget.width())))
+            pos.setY(min(max(pos.y(), g.top()), max(g.top(), g.bottom() + 1 - widget.height())))
+        widget.move(pos)
+
+    def _popup_editor(self, frame_id, button_name, text=''):
+        """A one-line editor that opens ON the button the user just clicked.
+
+        These were bare `QLineEdit()` widgets with no parent. A parentless
+        widget positions itself in SCREEN coordinates, so `setGeometry(200, 200,
+        …)` put the box at an absolute (200, 200) — the top-left of the display,
+        nowhere near the button — and the ones with no geometry at all landed on
+        (0, 0). Parenting it here and giving it Qt.Popup keeps it above the
+        panel, lets it be placed deliberately, and dismisses it on a click
+        elsewhere.
+
+        Falls back to the cursor position if the button cannot be located (a
+        panel rebuild between click and popup, say).
+        """
+        box = QLineEdit(self)
+        box.setWindowFlags(Qt.Popup)
+        box.setText('' if text is None else str(text))
+        box.selectAll()
+        btn = self.buttons_dict.get((frame_id, button_name))
+        box.resize(max(ui_px(120), btn.width() if btn is not None else 0), ui_px(26))
+        if btn is not None and btn.isVisible():
+            pos = btn.mapToGlobal(btn.rect().topLeft())
+        else:
+            pos = QCursor.pos()
+        # Show BEFORE clamping: a stylesheet or minimumSizeHint can enlarge the
+        # box past the requested size, and that only settles once it is shown —
+        # clamping against the requested size leaves it hanging off the edge.
+        box.show()
+        g = (QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen())
+        if g is not None:
+            g = g.availableGeometry()
+            pos.setX(min(max(pos.x(), g.left()),
+                         max(g.left(), g.right() + 1 - box.width())))
+            pos.setY(min(max(pos.y(), g.top()),
+                         max(g.top(), g.bottom() + 1 - box.height())))
+        box.move(pos)
+        box.raise_()
+        box.setFocus()
+        box.returnPressed.connect(box.hide)
+        return box
 
     def on_submit(self, text_box, data_frame, frame_id, button_name, button_type):
         global df_cont, df, snrmap, snr_value

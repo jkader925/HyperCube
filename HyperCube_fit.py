@@ -55,6 +55,225 @@ def _as_float_list(v):
 
 
 # ── model construction ───────────────────────────────────────────────────────
+def run_pool(cube, wavelengths, params, df, df_cont, z, R, gated, radec,
+             n_workers, err_cube=None, sigma_label=None, sequential=False,
+             max_nfev=512, stellar_specs=(), stellar_mask=None,
+             progress_cb=None, is_cancelled=None):
+    """Fit `gated` spaxels across a process pool. Returns `(line_rows, stellar_rows)`.
+
+    Lifted out of `FitParamsWindow._fit_cube_parallel`; the only things that
+    were Qt there were the progress bar and the cancel flag, so those become
+    `progress_cb(done, total)` and `is_cancelled() -> bool`.
+
+    The cube is shared read-only through shared memory and the constant context
+    is pickled once per worker, so only small row dicts cross the process
+    boundary. `radec` is precomputed `(ras, decs)` — WCS deliberately stays out
+    of the workers. `df`/`df_cont` must already have their matplotlib actor
+    columns dropped and `df_cont` must be indexed 0..N-1 (fit_one_spaxel looks
+    up `region_index` positionally).
+    """
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    cube = np.ascontiguousarray(cube)
+    shm = shared_memory.SharedMemory(create=True, size=int(cube.nbytes))
+    err_shm = None
+    try:
+        np.ndarray(cube.shape, dtype=cube.dtype, buffer=shm.buf)[:] = cube[:]
+
+        err_ctx = {}
+        if err_cube is not None and err_cube.shape == cube.shape:
+            err = np.ascontiguousarray(err_cube, dtype=np.float32)
+            err_shm = shared_memory.SharedMemory(create=True, size=int(err.nbytes))
+            np.ndarray(err.shape, dtype=err.dtype, buffer=err_shm.buf)[:] = err[:]
+            err_ctx = dict(err_shm_name=err_shm.name, err_shape=tuple(err.shape),
+                           err_dtype=str(err.dtype), sigma_label=sigma_label)
+
+        ctx = dict(
+            shm_name=shm.name, shape=tuple(cube.shape), dtype=str(cube.dtype),
+            wavelengths=np.asarray(wavelengths, float),
+            params_dumps=params.dumps(),
+            n_regions=len(df_cont), n_lines=len(np.unique(df['Line_ID'])),
+            df=df, df_cont=df_cont, z=z, R=R,
+            sequential=bool(sequential), max_nfev=int(max_nfev),
+            stellar_specs=list(stellar_specs), stellar_mask=stellar_mask,
+            **err_ctx)
+
+        ras, decs = radec
+        tasks = [(int(gated[k][0]), int(gated[k][1]), float(ras[k]), float(decs[k]))
+                 for k in range(len(gated))]
+        total = len(tasks)
+        print(f'Parallel Fit Cube: {total} spaxels across {n_workers} workers')
+
+        line_rows, stellar_rows, done = [], [], 0
+        # Pin BLAS to one thread per worker so N workers do not oversubscribe
+        # the cores. Children inherit the environment at import, which is too
+        # late to set inside the worker, so pin it in the parent for the pool's
+        # lifetime and restore afterwards.
+        thr_vars = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                    'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS')
+        saved = {k: os.environ.get(k) for k in thr_vars}
+        for k in thr_vars:
+            os.environ[k] = '1'
+        try:
+            ex = ProcessPoolExecutor(max_workers=n_workers,
+                                     mp_context=mp.get_context('spawn'),
+                                     initializer=_worker_init, initargs=(ctx,))
+            try:
+                futures = [ex.submit(_worker_fit_one, t) for t in tasks]
+                for fut in as_completed(futures):
+                    if is_cancelled is not None and is_cancelled():
+                        break
+                    try:
+                        rows, srows = fut.result()
+                    except Exception as e:
+                        print(f'worker task error: {type(e).__name__}: {e}')
+                        rows, srows = [], []
+                    line_rows.extend(rows)
+                    stellar_rows.extend(srows)
+                    done += 1
+                    if progress_cb is not None and (done % 16 == 0 or done == total):
+                        progress_cb(done, total)
+            finally:
+                cancelled = is_cancelled is not None and is_cancelled()
+                ex.shutdown(wait=not cancelled, cancel_futures=True)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return line_rows, stellar_rows
+    finally:
+        for _shm in (shm, err_shm):
+            if _shm is None:
+                continue
+            _shm.close()
+            try:
+                _shm.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def build_params(df, df_cont, z, velocity_updater=None, constraint_applier=None):
+    """Build the lmfit `Parameters` for a whole-cube (or single-spaxel) fit.
+
+    Lifted verbatim out of `FitParamsWindow.fit_cube`, where it was inline and
+    duplicated in near-identical form by `_fit_single_spaxel_impl` — the two had
+    already drifted (see the stellar note below). One implementation now serves
+    the GUI, the single-spaxel path and the headless runner.
+
+    Returns `(params, n_regions, n_lines, df)`. `df` comes back because
+    `velocity_updater` rewrites its constraints column and the caller needs the
+    rewritten frame.
+
+    `velocity_updater(df, z) -> df` and `constraint_applier(df, params)` are
+    injected rather than imported so this module stays free of HyperCube.py
+    (which pulls in Qt). Pass `HyperCube.update_constraints_with_velocity` and
+    `HyperCube.add_dataframe_constraints_to_params`.
+
+    A **stellar** continuum region is a fixed baseline subtracted from the
+    spectrum before the line fit, so its model continuum is held at zero. The
+    cube path previously left slope/intercept free there, handing the fit a
+    spurious linear continuum on top of the already-subtracted stellar one; the
+    single-spaxel path did not. This function does what the single-spaxel path
+    did.
+    """
+    params = Parameters()
+
+    # Velocity ties are rewritten to centroid ratios once. This is idempotent
+    # (it consumes the `vel ==` forms it matches), which is why the original
+    # could call it once per region x line without harm.
+    if velocity_updater is not None and 'constraints' in df.columns:
+        rest = pd.to_numeric(df.get('Rest Wavelength'), errors='coerce')
+        if np.isfinite(rest).any():
+            df = velocity_updater(df, z)
+
+    for i, row in df_cont.iterrows():
+        region_id = row['region_ID']
+
+        params.add(f'x{i + 1}_start', value=row['x1'], vary=False)
+        params.add(f'x{i + 1}_end', value=row['x2'], vary=False)
+
+        _ctype = str(row['cont_type']) if ('cont_type' in df_cont.columns
+                                           and pd.notna(row['cont_type'])) else 'linear'
+        _kx = _as_float_list(row['knots_x']) if 'knots_x' in df_cont.columns else []
+        _ky = _as_float_list(row['knots_y_0']) if 'knots_y_0' in df_cont.columns else []
+        _pc = _as_float_list(row['poly_coef_0']) if 'poly_coef_0' in df_cont.columns else []
+        is_poly = (_ctype == 'poly' and len(_pc) >= 1)
+        is_spline = (_ctype == 'spline' and len(_kx) >= 2 and len(_kx) == len(_ky))
+        is_stellar = (_ctype == 'stellar')
+
+        slope = row['Slope_0'] if np.isfinite(row['Slope_0']) else 0
+        intercept = row['Intercept_0'] if np.isfinite(row['Intercept_0']) else 0
+        if is_stellar:
+            slope = intercept = 0
+
+        params.add(f'slope{i + 1}', value=slope,
+                   vary=not (is_spline or is_poly or is_stellar))
+        params.add(f'intercept{i + 1}', value=intercept,
+                   vary=not (is_spline or is_poly or is_stellar))
+
+        if is_poly:
+            params.add(f'NP{i + 1}', value=len(_pc), vary=False)
+            for j in range(len(_pc)):
+                params.add(f'polyc{i + 1}_{j}', value=float(_pc[j]), vary=True)
+        else:
+            params.add(f'NP{i + 1}', value=0, vary=False)
+
+        if is_spline:
+            ptp = (max(_ky) - min(_ky)) if len(_ky) > 1 else 0.0
+            _delta = 0.5 * ptp if ptp > 0 else max(abs(np.mean(_ky)), 1.0)
+            params.add(f'NK{i + 1}', value=len(_kx), vary=False)
+            for k in range(len(_kx)):
+                params.add(f'knotx{i + 1}_{k}', value=float(_kx[k]), vary=False)
+                params.add(f'knoty{i + 1}_{k}', value=float(_ky[k]), vary=True,
+                           min=float(_ky[k]) - _delta, max=float(_ky[k]) + _delta)
+        else:
+            params.add(f'NK{i + 1}', value=0, vary=False)
+
+        if i < len(df_cont) - 1:
+            next_row = df_cont.iloc[i + 1]
+            params.add(f'x_int_{i + 1}_start', value=row['x2'], vary=False)
+            params.add(f'x_int_{i + 1}_end', value=next_row['x1'], vary=False)
+            params.add(f'slope_int_{i + 1}', value=slope, vary=True)
+            params.add(f'intercept_int_{i + 1}', value=intercept, vary=True)
+
+        params.add(f'NR{i + 1}', value=len(df[df['region_ID'] == region_id]),
+                   vary=False)
+
+    # Gaussians, in model order. Not nested inside the region loop: the original
+    # re-added every line once per region, which was merely wasteful, but the
+    # result is identical.
+    for j, line in enumerate(df.itertuples(), start=1):
+        # Cast explicitly: after pd.concat these columns can be object dtype,
+        # and lmfit misbehaves silently on non-float initial values.
+        _amp = np.float64(line.Amp_0)
+        _cen = np.float64(line.Centroid_0)
+        _sigma = np.float64(line.Sigma_0)
+
+        def _lim(v):
+            v = np.float64(v)
+            return v if np.isfinite(v) else None
+
+        if _amp == 0:
+            _amp = 1e-30      # give the optimizer something to scale against
+        params.add(f'amp{j}', value=_amp, vary=True,
+                   min=_lim(line.Amp_0_lowlim), max=_lim(line.Amp_0_highlim))
+        params.add(f'cen{j}', value=_cen, vary=True,
+                   min=_lim(line.Centroid_0_lowlim), max=_lim(line.Centroid_0_highlim))
+        params.add(f'sigma{j}', value=_sigma, vary=True,
+                   min=_lim(line.Sigma_0_lowlim), max=_lim(line.Sigma_0_highlim))
+
+    n_regions = len(df_cont)
+    n_lines = len(np.unique(df['Line_ID']))
+
+    if constraint_applier is not None:
+        constraint_applier(df, params)
+
+    return params, n_regions, n_lines, df
+
+
 def build_model(n_regions, n_lines):
     """Rebuild the piecewise (continuum + Gaussians) lmfit Model. Matches the
     construction in HyperCube.fit_cube."""
@@ -351,8 +570,21 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
                 param.min = param.min / flux_scale
             if param.max is not None:
                 param.max = param.max / flux_scale
-        elif pname.startswith('intercept'):
+        elif pname.startswith('intercept') or pname.startswith('slope'):
+            # `slope*` (and the inter-region `slope_int*`/`intercept_int*`) are
+            # flux-per-Angstrom and flux, so they scale exactly like the
+            # intercept. Only `intercept` was being scaled here, while line
+            # ~639 multiplies the fitted *slope* back by flux_scale on the way
+            # out — an asymmetry that stayed invisible for as long as every
+            # slope started at 0 (0/s == 0). Seeding a real continuum from the
+            # data exposed it: the seeded slope entered as if it were already
+            # in scaled units, making the model's continuum steeper by
+            # flux_scale and driving rchisq_w into the millions.
             param.set(value=param.value / flux_scale)
+            if param.min is not None and np.isfinite(param.min):
+                param.min = param.min / flux_scale
+            if param.max is not None and np.isfinite(param.max):
+                param.max = param.max / flux_scale
         elif pname.startswith('knoty'):
             param.set(value=param.value / flux_scale)
             if param.min is not None and np.isfinite(param.min):
@@ -456,8 +688,10 @@ def fit_one_spaxel(spectrum, stellar_baseline, wavelengths, params_to_use, model
                 cont_params.update({
                     f'cont_region{region_index}_x_int_start': params_to_use[f'x_int_{region_index}_start'].value,
                     f'cont_region{region_index}_x_int_end': params_to_use[f'x_int_{region_index}_end'].value,
+                    # Scaled on the way in with the other flux-unit params, so
+                    # it has to come back out the same way.
                     f'cont_region{region_index}_slope_int_init': params_to_use[f'slope_int_{region_index}'].init_value,
-                    f'cont_region{region_index}_slope_int_fit': result.params[f'slope_int_{region_index}'].value,
+                    f'cont_region{region_index}_slope_int_fit': result.params[f'slope_int_{region_index}'].value * flux_scale,
                 })
 
             amp_key = f'amp{line_idx}'

@@ -142,7 +142,7 @@ From your new `hypercube` conda environment, open the tool via the following com
 python hypercube.py
 ```
 
-This should launch the main application window. You can now load the IFS data using the `Open FITS` button on the bottom right of the application window and selecting the file `IRAS_F23365+3604.fits`. The main application (visualizer) window will now show to panels: on the left is the image viewer, which initially shows a white light image of the galaxy (from integrating the spectrum in each spectral pixel, or "spaxel"), on the right is a live spectrum viewer that updates as you move the cursor across the white light image. 
+This should launch the main application window. You can now load the IFS data using the `Open FITS` button on the bottom right of the application window and selecting the file `IRAS_F23365+3604.fits`. You can also **drag the file from Finder and drop it anywhere on the window** — the same load, without the dialog. Either way a green progress bar runs in the status bar, in the slot where the filename will appear, naming the stage it is on; a large cube spends most of it collapsing the white-light image. The main application (visualizer) window will now show to panels: on the left is the image viewer, which initially shows a white light image of the galaxy (from integrating the spectrum in each spectral pixel, or "spaxel"), on the right is a live spectrum viewer that updates as you move the cursor across the white light image. 
 
 ### Interacting with the Image Viewer Panel
 As the cursor is moved around the image, an orange rectangle indicates the currently focused spaxel. You can lock the spaxel by pressing the `L` key. To unlock, move the cursor back to the image viewer panel and press `L` again.
@@ -270,7 +270,7 @@ A **?** help button lists the available parameters, operators, and the lines cur
 
 #### Kinematic Groups (K-groups)
 
-For multi-component fits it is often desirable for several lines to share one kinematic solution. Assign lines to the same **K-group** (K1–K5, via the checkboxes in the Line Name window) to tie their **velocity and velocity dispersion** together during fitting — every member shares the same velocity and the same km/s dispersion, with widths and centroids scaled by each line's rest wavelength. The first line of a group (in model order) is the **reference** that carries the group's free kinematics, and the window indicates which line that is. K-groups are a shortcut that writes the equivalent relational constraints for you, and they coexist non-destructively with any manual sigma constraints — a manual constraint is held inactive while the line is grouped and re-activates if you remove it from the group.
+For multi-component fits it is often desirable for several lines to share one kinematic solution. Assign lines to the same **K-group** (K1–K5, via the checkboxes in the Line Name window) to tie their **velocity and velocity dispersion** together during fitting — every member shares the same velocity and the same km/s dispersion, with widths and centroids scaled by each line's rest wavelength. One member is the **reference** that carries the group's free kinematics, and the window indicates which line that is. A group anchors on its first line in model order until you choose otherwise — press **Make this line the reference for its K-group** in the Line Name window of whichever line should hold it. The reference is the line whose velocity and dispersion stay free while the rest of the group is tied to them, so it wants to be the best-measured line in the group rather than whichever happens to come first: if a group spans Hγ and Hα, anchoring on Hα is usually what you want. Promoting a line rewrites the group's ties immediately, rescaling each σ ratio to the new anchor's rest wavelength. The promotion belongs to the group it was made in — moving a line to another group, or out of grouping entirely, drops it, and re-running Smart Constraints (which rebuilds the grouping from scratch) resets every anchor to the default. K-groups are a shortcut that writes the equivalent relational constraints for you, and they coexist non-destructively with any manual sigma constraints — a manual constraint is held inactive while the line is grouped and re-activates if you remove it from the group.
 
 > **Note:** velocity dispersion (σ) is displayed and entered in **km/s** throughout the GUI and is included (alongside the wavelength-space values) in the CSV and FITS output.
 
@@ -316,6 +316,28 @@ Validated by Monte Carlo against the true scatter of repeated refits: the report
 
 **Reading the χ².** With weights in place, `rchisq_w` — the reduced χ² over the weighted pixels — is the meaningful goodness-of-fit number and sits near 1 for a good fit with a correct noise model. It is available as a Quality Map and as a Rectify/Mask criterion. lmfit's native `rchisq` divides by the *full* spectrum length rather than the fitted pixels, so it reads low by roughly the fraction of the spectrum your fit windows cover and should not be compared to 1.
 
+### The S/N mask
+
+The S/N map gates which spaxels get fit. Per spaxel and per line in the model it is
+
+> S/N = (95th-percentile flux in a window around the line centre − **the local continuum**) ÷ (MAD noise in the two continuum flanks)
+
+taking the best line for each spaxel. The continuum subtraction is what makes this a measurement of the *line* rather than of *brightness*: without it the ratio is (continuum + line)/noise, so any bright continuum source passes at any threshold even with no emission whatsoever — a foreground star in UGC 05101 scored S/N = 43 on a spectrum containing no Hα at all.
+
+The flanks are not assumed to be line-free, because they frequently are not — at z ≈ 0.04 both [N II] lines fall inside Hα's default flanks. The continuum level is therefore taken after two asymmetric clipping passes that drop channels more than 3σ *above* the running median, removing line cores while leaving the noise distribution and any absorption intact. Without that clipping the flank median is biased upward by exactly the lines being measured, and that bias is then subtracted straight off the line.
+
+Because the numbers this produces are smaller than the un-subtracted ones it replaced, a threshold carried over from an older version of HyperCube is a **stricter** cut than it used to be; re-check it against the mask contour. Maps cached or stored in a session under the old definition are discarded rather than reused.
+
+### Resolving power
+
+`R` is read from the cube at ingest and shown on the **R:** button; its tooltip says where the value came from, so a derived number is never mistaken for one you typed. R sets the width HyperCube convolves the stellar templates to before pPXF fits a LOSVD, so getting it wrong biases σ\*.
+
+Almost no IFU cube states R outright, but every one records the configuration that determines it, so HyperCube works down three tiers: a header keyword giving R (or a resolution element) directly; then the named instrument — KCWI/KCRM grating + slicer, MIRI MRS channel + band, NIRSpec disperser, the MUSE LSF polynomial; then nothing, leaving the field blank.
+
+For KCWI the stored quantity is the **resolution element** (FWHM in Å) per grating, not R, because a grating's FWHM is fixed while R = λ/FWHM slides across the band. The survey's own coadds confirm this: RH1 and RH2 carry `SPECRES` 1800 @ 6150 Å and 2025 @ 6900 Å, which is one FWHM (3.42 vs 3.41 Å) seen at two wavelengths rather than two resolving powers. Entries for BH1–3, RH1 and RH2 are calibrated against those headers; the rest are nominal and say so wherever they are used.
+
+A coadded **supercube** gets no value at all, deliberately: it keeps no instrument keywords, and its constituent gratings have different resolutions, so no single R describes it. HyperCube reads the combine step's `HISTORY` and prints which gratings went in and their resolution elements, leaving you to set R for the region you are fitting. If R is left blank, pPXF assumes 3000 — and now says so rather than assuming it silently.
+
 ### Calibrated fit-quality metrics & the Quality Map
 
 Reduced χ² alone — even the weighted `rchisq_w` — averages the line cores together with the far more numerous continuum pixels, so a badly-fit line profile can hide inside a good-looking global number. HyperCube therefore computes, per spaxel, a set of calibrated, scale-free quality statistics that compare the line cores against the off-line continuum directly:
@@ -325,6 +347,11 @@ Reduced χ² alone — even the weighted `rchisq_w` — averages the line cores 
 - **Runs z** — a runs test on the residual signs flags systematic *shape* errors even when amplitudes look right.
 - **Calibrated continuum χ²** — reduced χ² over off-line pixels (≈1 for a good fit); the calibration anchor.
 
+The **S/N mask** toggle on the image toolbar draws the current threshold as a red
+contour over the map, and keeps it there through colormap, stretch, rotation,
+flip, spatial-mask and parameter-map changes. Loading a template turns it on, since
+the template's own S/N threshold has just been applied.
+
 The **Quality Map ▾** button renders any of these — plus the weighted `rchisq_w` and the native rChi² — as a cube map, so you can *see* which spaxels actually failed. These columns are written to the CSV/FITS output.
 
 ### Rectify Bad Fits
@@ -333,10 +360,17 @@ The **Quality Map ▾** button renders any of these — plus the weighted `rchis
 
 It works in four steps:
 
-1. **Flag the bad spaxels.** Each fitted spaxel is scored by its *calibrated* core/continuum residual ratio (the headline quality metric — noise-independent and comparable across the cube), **not** the misleading raw χ². A spaxel is "bad" if that ratio exceeds the rectify threshold (**2.0**) or is undefined (a failed/degenerate fit). Because the core mask spans each line's full *allowed* centroid window, a fit that misses the real peak entirely is correctly flagged rather than scoring as good.
-2. **Seed from the best good neighbor.** Each bad spaxel is re-fit using initial guesses (amplitude, centroid, width, and the region-1 continuum) copied from the *best-scoring* good spaxel among its 8 immediate neighbors, clamped to each parameter's bounds. This is a spatial-smoothness prior: it exploits the spatial coherence of real kinematic fields, so a degenerate spaxel inherits a working solution from right next door. If no neighbor is good, it falls back to the base template's initial guesses. Spaxels below the SNR threshold are skipped entirely.
-3. **Targeted multi-start fallback.** If the neighbor-seeded fit is *still* bad, Rectify tries a small set of physically-motivated restarts for the known two-component (core + broad) failure modes — **narrow-only**, **broad-only**, **swapped**, and **equal-split** — and keeps whichever gives the lowest core/continuum ratio.
-4. **Keep only the winner.** Every candidate fit for a spaxel is evaluated without committing; only the lowest-ratio result is written back into the cube fit, so a rectify pass can never make a spaxel worse.
+1. **Decide what counts as a bad fit.** One table lists the [calibrated quality metrics](#calibrated-fit-quality-metrics--the-quality-map); tick the ones that matter and give each its own operator (`>`, `<`, `|·| >`, `|·| <`) and limit, so the number you type means what it says — a z-score defaults to `|·| > 3`, a ratio to `> 2`. The selector at the top chooses how they combine: **any** (one tripped rule marks a spaxel for repair) or **all** (every ticked rule must trip). A live count underneath shows how many spaxels will be re-fit, updating as you change anything.
+
+   That choice governs *which spaxels are repaired* only. A spaxel must always pass **every** ticked rule to be trusted as a seed — an AND-gate, so a severe failure in one metric cannot be outvoted by several healthy ones. Loosening what gets repaired must not loosen what does the repairing.
+2. **One table drives everything.** The spaxels that fail are the ones re-fit; the spaxels that pass are the only ones allowed to seed a repair or to be accepted as an improvement. Because it is a single rule, the spaxels being repaired and the spaxels trusted to repair them can never disagree. The same criteria also produce a composite score — the mean distance from each metric's ideal, in units of its own limit — which ranks fits against each other. Spaxels below the SNR threshold are skipped entirely; *Also re-fit failed (non-finite) spaxels* controls whether fits that produced no usable metrics at all are repaired or left alone.
+3. **Seed from the good fits nearby.** Each bad spaxel is re-fit from initial guesses (amplitude, centroid, width, and the region-1 continuum) copied from its best *good* neighbors, clamped to each parameter's bounds — a spatial-smoothness prior that exploits the spatial coherence of real kinematic fields. Three things make this stronger than a single lookup:
+   - **The best *K* neighbors are each tried as an independent starting point** (default 3), and the best result wins. The search stops at the first seed that lands a good fit, so raising K costs nothing on easy spaxels.
+   - **The search grows outward** — radius 1 is the 8 immediate neighbors; if none is good it tries radius 2, then 3 (configurable). Without this the middle of any bad patch larger than ~3×3 has no good neighbor at all and falls back to the generic initial guess, which is exactly where the spatial prior is most needed. Nearer neighbors are always preferred over better-scoring distant ones.
+   - **Repairs propagate.** A rescued spaxel immediately becomes a valid donor for its neighbors, and spaxels are processed most-good-neighbors-first, so repairs flood inward from the rim of a bad region rather than stopping at it. Passes repeat until one rescues nothing (default cap 5).
+4. **Keep only the winner, and never go backwards.** Every candidate is evaluated without committing, and **the spaxel's existing fit competes as one of the candidates**. Only a strictly better-scoring result is written back, so a rectify pass cannot degrade a spaxel — which is also what makes iterating safe. If every neighbor seed still fails, Rectify falls back to a small set of physically-motivated restarts for the known two-component (core + broad) failure modes — **narrow-only**, **broad-only**, **swapped**, and **equal-split**.
+
+Every repaired row records where it came from: `rectify_pass`, `rectify_seed` (e.g. `neighbour(12,34)@r2`, `restart:swapped`, `incumbent`) and `rectify_score`, so a rectified fit is auditable rather than indistinguishable from an ordinary one.
 
 Constraints, kinematic groups, and (if enabled) [sequential core→outflow staging](#sequential-coreoutflow-fitting) all carry through to the rectify refits automatically. The combination of a calibrated metric, a spatial prior, and targeted restarts resolves most degenerate/initialization failures without manual intervention; the handful that survive can be cleaned up with [per-spaxel correction](#per-spaxel-fit-correction).
 
@@ -364,11 +398,60 @@ Stellar results are included when you **Save Fit** (CSV) and **Save Fit to FITS 
 
 # Pipeline Usage Mode
 
+HyperCube can run without a GUI: `hypercube_batch` expands a rest-frame
+**template** across a **manifest** of cubes and fits each one, writing products
+the GUI reopens. Full design in `HyperCube_Templates_SPEC.md`.
+
+```
+python -m hypercube_batch --template MAUNA_MUSE_core.hct.csv \
+                          --manifest MAUNA_MUSE.manifest.csv \
+                          --out runs/ [--targets A,B] [--cores 8] [--dry-run]
+```
+
 ### Initiating Models with Configuration Files
+
+A **template** (`*.hct.csv`) describes a model the way physics does — rest
+wavelengths, velocity offsets from systemic, *intrinsic* velocity dispersions,
+bounds, K-groups, constraints — so one file applies to every galaxy observed
+with a given instrument. Nothing galaxy-specific lives in it. The three things
+that are come from elsewhere: redshift and cube path from the **manifest**
+(`*.manifest.csv`, one row per target), and the instrument's resolution from
+**the cube itself**.
+
+Expansion combines them. Rest wavelengths are placed at `rest·(1+z)·(1+v/c)`;
+intrinsic σ is broadened by the instrument LSF **at each line's own observed
+wavelength** (which is why one template is portable — MUSE's resolving power
+varies 59% across a single model); relative amplitudes are scaled to the cube's
+own flux units. Lines and continuum regions outside a given cube's coverage are
+dropped, `Line_ID` renumbered, constraints naming a dropped line removed, and
+K-groups re-anchored — every one of those recorded in a coverage report rather
+than done silently. A `required` flag makes a line or region abort the target
+instead of being dropped.
+
+**In the GUI**, the **Save Template** and **Load Template** buttons sit on the
+*Output:* toolbar row. Save writes the model you have built; Load applies one to
+whatever cube is currently open, placing its lines at that galaxy's redshift and
+broadening its dispersions by that instrument's LSF. Both need the cube's
+redshift set first (the **z:** button) — that is what converts between the rest
+frame the template is stored in and the observed frame the fit works in. Load
+reports anything it dropped for coverage and any K-group it re-anchored.
+
+You can also write a template in a spreadsheet: it is a sectioned CSV.
 
 ### Batch Processing
 
-*work in progress*
+`--dry-run` expands and reports coverage without fitting — this is how you find
+out which line/galaxy combinations are observable at all before spending any
+time on them. Each target writes `<target>_<template>_Fit.csv` in the same
+five-section layout **Load Fit (CSV)** reads, plus a coverage report; a
+`run_log.csv` records the template, its version, the git SHA, and per-target
+timings. A failing target is logged and the run continues, exiting non-zero at
+the end.
+
+This does **not** make per-spaxel fitting faster — it is the same kernel and the
+same process pool the GUI uses (`build_params` and `run_pool` in
+`HyperCube_fit.py`, shared by both). What it buys is unattended queued runs,
+reproducibility, and running somewhere other than a desktop.
 
 # Troubleshooting
 
