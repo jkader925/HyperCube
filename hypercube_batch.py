@@ -58,6 +58,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 import HyperCube_LSF as hlsf
+import HyperCube_SelfSky as hcss
 import HyperCube_Templates as HT
 import HyperCube_fit as HF
 import HyperCube_Noise
@@ -176,6 +177,28 @@ def run_target(template, row, args, out_dir):
     data, header, wl, wcs, ext = load_cube(row['cube_path'],
                                            row.get('cube_ext') or None,
                                            with_data=not args.dry_run)
+
+    # Self-sky, applied before anything reads the cube so the gate, the noise
+    # model and the fit all see the same data. The mask is rebuilt here from a
+    # declared recipe rather than shipped as an array: a batch run must be
+    # reproducible from its arguments, and a stale .npy mask silently applied to
+    # the wrong cube is exactly the failure this avoids.
+    selfsky_note = ''
+    if args.selfsky and data is not None:
+        wl_img = hcss.white_light(data, step=max(1, data.shape[0] // 400))
+        live = hcss._live(data)
+        mask = hcss.faintest_fraction_mask(wl_img, args.selfsky / 100.0, live=live)
+        try:
+            res = hcss.build_sky(data, mask,
+                                 statistic=args.selfsky_statistic,
+                                 mode=args.selfsky_mode,
+                                 n_col_blocks=args.selfsky_blocks,
+                                 mask_sources=(f'faintest {args.selfsky:.0f}% white light',))
+        except hcss.SkyPoolTooSmall as exc:
+            raise SystemExit(f'{tid}: self-sky refused — {exc}')
+        data = hcss.apply_sky(data, res)
+        selfsky_note = res.describe()
+        print(f'  [{tid}] self-sky: {selfsky_note}', flush=True)
     lsf = HT.lsf_for_cube(header, wl, muse_model=args.muse_lsf)
 
     regions_obs = [(HT._as_float(r['x1_rest_A']) * (1 + z),
@@ -243,6 +266,12 @@ def run_target(template, row, args, out_dir):
         stellar_mask = df['Centroid_0'].to_numpy()
 
     err, sigma_label = error_cube_for(row['cube_path'], data.shape, ext)
+    if selfsky_note and err is not None:
+        # Same requirement as the GUI: the fit is 1/sigma-weighted inside the
+        # windows, so the sky estimate's own variance must enter sigma or the
+        # corrected region is over-weighted.
+        err = hcss.propagate_sky_variance(err, res, data.shape)
+        sigma_label = f'{sigma_label} + self-sky'
     ras, decs = sky_coords(wcs, [g[0] for g in gated], [g[1] for g in gated])
 
     last = [0]
@@ -306,6 +335,15 @@ def main(argv=None):
     ap.add_argument('--sequential', action='store_true',
                     help='staged core->outflow fit')
     ap.add_argument('--coverage-nsigma', type=float, default=3.0)
+    ap.add_argument('--selfsky', type=float, default=None, metavar='PCT',
+                    help='subtract a self-sky built from the faintest PCT%% of '
+                         'spaxels by white light (e.g. 60). Off by default.')
+    ap.add_argument('--selfsky-statistic', default='median',
+                    choices=list(hcss.STATISTIC_NAMES),
+                    help='combination statistic (no mean; see HyperCube_SelfSky)')
+    ap.add_argument('--selfsky-mode', default='global',
+                    choices=['global', 'per-column'])
+    ap.add_argument('--selfsky-blocks', type=int, default=hcss.DEFAULT_COL_BLOCKS)
     ap.add_argument('--muse-lsf', default=hlsf.MUSE_LSF_DEFAULT,
                     choices=sorted(hlsf.MUSE_LSF_MODELS))
     args = ap.parse_args(argv)

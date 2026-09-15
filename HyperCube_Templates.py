@@ -732,17 +732,25 @@ def write_manifest(path, frame):
 
 
 def resolve_redshift(name, timeout=10):
-    """NED redshift for an object name, or None. Qt-free; network-dependent.
+    """NED redshift for an object name. -> (name_as_supplied, ned_name, z) or None.
 
-    Mirrors the resolver behind the GUI's "Resolve name (NED)" button. Used
-    only to *draft* a manifest — NED returns a redshift for an identifier, not
-    necessarily the systemic redshift you want to fit against, so the result is
-    always for review (§5).
+    Qt-free; network-dependent. Mirrors the resolver behind the GUI's "Resolve
+    name (NED)" button. Used only to *draft* a manifest — NED returns a redshift
+    for an identifier, not necessarily the systemic redshift you want to fit
+    against, so the result is always for review (§5).
+
+    **The caller's name is returned unchanged as the first element.** NED is
+    asked for the MEASUREMENT, never for a relabelling: the canonical identifier
+    for "F01364-1042" may come back as "2MASX J01385289-1027113", and writing
+    that into a manifest breaks every join the user has against their own
+    catalogues, file names and target directories. NED's own name is returned
+    alongside, as evidence of what matched, so a reviewer can confirm the
+    resolution was correct without the identity being silently swapped.
     """
     try:
         from astroquery.ipac.ned import Ned
         result = Ned.query_object(name)
-        return str(result['Object Name'][0]), float(result['Redshift'][0])
+        return name, str(result['Object Name'][0]), float(result['Redshift'][0])
     except ImportError:
         pass
     except Exception:
@@ -760,7 +768,7 @@ def resolve_redshift(name, timeout=10):
             return None
         d = dict(zip(rows[0].split('\t'), rows[1].split('\t')))
         z = d.get('Redshift', '').strip()
-        return d.get('Object Name', name).strip(), (float(z) if z else None)
+        return name, d.get('Object Name', name).strip(), (float(z) if z else None)
     except Exception:
         return None
 

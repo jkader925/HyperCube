@@ -63,6 +63,7 @@ import HyperCube_LSF    # Qt-free instrument line-spread functions
 import HyperCube_Templates as hct  # Qt-free rest-frame model templates
 import HyperCube_Quality as hcq  # Qt-free fit-quality criteria (Rectify goodness)
 import HyperCube_SmartConstraints as hcsc  # Qt-free auto-constraint/K-group logic
+import HyperCube_SelfSky as hcss  # Qt-free self-sky subtraction (SPEC: HyperCube_SelfSky_SPEC.md)
 try:
     import HyperCube_pPXF as hcppxf
 except Exception as _e:
@@ -79,6 +80,59 @@ except Exception as _e:
 global FITS_HEADER, FITS_DATA
 FITS_HEADER = None
 FITS_DATA = None
+
+# ── Self-sky subtraction ─────────────────────────────────────────────────────
+# The correction is non-destructive: the pristine cube and error cube are kept
+# here so Revert restores them exactly, and so a corrected cube can never be
+# mistaken for an uncorrected one (SELFSKY_INFO is written into the fit CSV).
+SELFSKY_ORIG_CUBE = None    # ndarray  — the cube as loaded, before subtraction
+SELFSKY_ORIG_SIGMA = None   # ndarray  — ERROR_CUBE before the variance penalty
+SELFSKY_RESULT = None       # hcss.SkyResult
+SELFSKY_MASK = None         # bool (ny, nx) — stored so a session can rebuild
+SELFSKY_INFO = {}           # provenance dict written to the fit CSV
+
+
+def selfsky_active():
+    return SELFSKY_RESULT is not None
+
+
+def selfsky_provenance():
+    """Provenance columns for the fit CSV's scale/units block.
+
+    A silently sky-corrected cube must not be indistinguishable from an
+    uncorrected one in the fit output (SPEC 2.7).
+    """
+    if not selfsky_active():
+        return {'selfsky_applied': False}
+    return dict(SELFSKY_INFO)
+
+
+def apply_selfsky(cube_corrected, sigma_corrected, result, mask, info):
+    """Install a self-sky correction, remembering what to restore."""
+    global FITS_DATA, ERROR_CUBE
+    global SELFSKY_ORIG_CUBE, SELFSKY_ORIG_SIGMA, SELFSKY_RESULT, SELFSKY_MASK, SELFSKY_INFO
+    if SELFSKY_ORIG_CUBE is None:          # first apply: remember the pristine state
+        SELFSKY_ORIG_CUBE = FITS_DATA
+        SELFSKY_ORIG_SIGMA = ERROR_CUBE
+    FITS_DATA = cube_corrected
+    if sigma_corrected is not None:
+        ERROR_CUBE = sigma_corrected
+    SELFSKY_RESULT, SELFSKY_MASK, SELFSKY_INFO = result, mask, dict(info)
+
+
+def revert_selfsky():
+    """Restore the pristine cube and error cube. Returns True if anything changed."""
+    global FITS_DATA, ERROR_CUBE
+    global SELFSKY_ORIG_CUBE, SELFSKY_ORIG_SIGMA, SELFSKY_RESULT, SELFSKY_MASK, SELFSKY_INFO
+    if SELFSKY_ORIG_CUBE is None:
+        return False
+    FITS_DATA = SELFSKY_ORIG_CUBE
+    ERROR_CUBE = SELFSKY_ORIG_SIGMA
+    SELFSKY_ORIG_CUBE = SELFSKY_ORIG_SIGMA = None
+    SELFSKY_RESULT = SELFSKY_MASK = None
+    SELFSKY_INFO = {}
+    return True
+
 
 # ── Measurement errors ───────────────────────────────────────────────────────
 # ERROR_CUBE holds per-pixel 1σ flux uncertainties with the same shape as
@@ -180,8 +234,13 @@ def _flank_continuum(cont):
 
 
 def compute_snr_map(data, wavelengths, centroids, search_window_width,
-                    continuum_offset, continuum_width):
+                    continuum_offset, continuum_width, per_line=False):
     """Per spaxel, the best S/N over the given line centres.
+
+    With per_line=True, returns the list of one map per usable centroid instead
+    of their maximum, in the order the centroids were given. The per-line maps
+    are what the combined map is built FROM, so the two can never disagree —
+    which is the reason this is a flag here rather than a second function.
 
     S/N per line = (95th-percentile flux in a window around the line centre,
     **minus the local continuum**) / (MAD-based noise in the two continuum
@@ -199,7 +258,7 @@ def compute_snr_map(data, wavelengths, centroids, search_window_width,
     """
     wavelengths = np.asarray(wavelengths, dtype=float)
     _, nx, ny = np.shape(data)
-    per_line = []
+    per_line_maps = []
     for line_center in centroids:
         try:
             line_center = float(line_center)
@@ -230,16 +289,18 @@ def compute_snr_map(data, wavelengths, centroids, search_window_width,
             usable = np.isfinite(noise) & (noise > 0) & np.isfinite(level)
             # The line above its own continuum — not the total flux there.
             amplitude = peak_flux - level
-            per_line.append(np.where(usable,
-                                     amplitude / np.where(usable, noise, 1.0), 0.0))
+            per_line_maps.append(np.where(usable,
+                                          amplitude / np.where(usable, noise, 1.0), 0.0))
 
-    if not per_line:
+    if per_line:
+        return per_line_maps
+    if not per_line_maps:
         return np.zeros((nx, ny))
     with warnings.catch_warnings():
         # A spaxel that is NaN in every line's window has no S/N to report;
         # nanmax says so with a warning and a NaN, which is the answer.
         warnings.simplefilter('ignore', RuntimeWarning)
-        return np.nanmax(np.stack(per_line, axis=0), axis=0)
+        return np.nanmax(np.stack(per_line_maps, axis=0), axis=0)
 
 
 def invalidate_snr_cache(reason=''):
@@ -4540,6 +4601,16 @@ class ViewerWindow(QMainWindow):
             'error_spec':        ({k: ERROR_INFO.get(k)
                                    for k in ('mode', 'path', 'ext', 'kind', 'label')}
                                   if ERROR_CUBE is not None else None),
+            # Self-sky: store the MASK plus the parameters, never the corrected
+            # cube. The mask is ~13 kB against ~150 MB for the cube, and storing
+            # the resolved boolean (rather than the recipe that built it) means a
+            # fit-derived mask restores exactly without needing the fit back.
+            'selfsky_spec':      ({'mask': SELFSKY_MASK,
+                                   'statistic': SELFSKY_RESULT.statistic,
+                                   'mode': SELFSKY_RESULT.mode,
+                                   'n_col_blocks': max(len(SELFSKY_RESULT.col_edges) - 1, 1),
+                                   'sources': list(SELFSKY_RESULT.mask_sources)}
+                                  if selfsky_active() else None),
         }
         try:
             with open(file_path, 'wb') as f:
@@ -4600,6 +4671,34 @@ class ViewerWindow(QMainWindow):
                           'using the empirical estimate.')
                     set_error_cube(None, {'mode': 'empirical',
                                           'source': HyperCube_Noise.SRC_EMPIRICAL})
+
+        # 1b) Self-sky: rebuild the correction from the stored mask.
+        _sspec = session.get('selfsky_spec')
+        if _sspec is not None and FITS_DATA is not None:
+            try:
+                _res = hcss.build_sky(FITS_DATA, _sspec['mask'],
+                                      statistic=_sspec['statistic'],
+                                      mode=_sspec['mode'],
+                                      n_col_blocks=_sspec.get('n_col_blocks',
+                                                              hcss.DEFAULT_COL_BLOCKS),
+                                      mask_sources=tuple(_sspec.get('sources', ())))
+                _corr = hcss.apply_sky(FITS_DATA, _res)
+                _sig = hcss.propagate_sky_variance(ERROR_CUBE, _res, np.shape(FITS_DATA))
+                apply_selfsky(_corr, _sig, _res, _sspec['mask'],
+                              {'selfsky_applied': True,
+                               'selfsky_statistic': _res.statistic,
+                               'selfsky_mode': _res.mode,
+                               'selfsky_n_mask': _res.n_mask,
+                               'selfsky_sources': ' AND '.join(_res.mask_sources),
+                               'selfsky_fallback_cols': len(_res.fallback_cols)})
+                self.fits_data = FITS_DATA
+                print(f'Session: self-sky restored — {_res.describe()}')
+            except Exception as e:
+                # Never leave a half-applied correction: a cube that is partly
+                # corrected is worse than one that is not corrected at all.
+                revert_selfsky()
+                print(f'Session: self-sky could NOT be restored ({e}); '
+                      'the cube is uncorrected.')
 
         # 2) Restore the analysis dataframes / globals.
         df_obs      = session.get('df_obs', df_obs)
@@ -5060,8 +5159,17 @@ class ViewerWindow(QMainWindow):
             layout.addLayout(btn_row)
 
             def _apply(ned_name, ned_z):
-                name_edit.setText(ned_name)
-                df_obs.loc[0, 'sourcename'] = ned_name
+                # The user's name is authoritative. NED is consulted for the
+                # MEASUREMENT (redshift), never to relabel the target: the
+                # canonical identifier NED returns for "F01364-1042" may be
+                # "2MASX J01385289-1027113", and silently substituting it breaks
+                # every join the user has against their own catalogues, file
+                # names and manifests. Adopt NED's name only when the user gave
+                # none at all.
+                user_name = name_edit.text().strip()
+                label = user_name or ned_name
+                name_edit.setText(label)
+                df_obs.loc[0, 'sourcename'] = label
                 df_obs.loc[0, 'redshift']   = ned_z
                 # Enable the background image button now that source is resolved
                 if hasattr(self, 'bkg_image_btn'):
@@ -5077,7 +5185,7 @@ class ViewerWindow(QMainWindow):
                     ned_name = str(r['Object Name'][0])
                     ned_z    = float(r['Redshift'][0])
                     _apply(ned_name, ned_z)
-                    status.setText(f'✓  {ned_name}   z = {ned_z:.6f}')
+                    status.setText(f'✓  z = {ned_z:.6f}   (NED matched: {ned_name})')
                 except Exception as e:
                     status.setText(f'NED query failed: {e}')
 
@@ -5097,7 +5205,7 @@ class ViewerWindow(QMainWindow):
                     ned_name = str(r['Object Name'][0])
                     ned_z    = float(r['Redshift'][0])
                     _apply(ned_name, ned_z)
-                    status.setText(f'✓  {ned_name}   z = {ned_z:.6f}')
+                    status.setText(f'✓  z = {ned_z:.6f}   (NED matched: {ned_name})')
                 except Exception as e:
                     status.setText(f'NED query failed: {e}')
 
@@ -7072,8 +7180,67 @@ class ViewerWindow(QMainWindow):
         except Exception as e:
             print(f"Mask preview contour failed: {type(e).__name__}: {e}")
 
+    def show_sky_region_preview(self, keep_field):
+        """Preview a self-sky region: outline what is KEPT, hatch what is NOT.
+
+        keep_field is 1.0 where the spaxel contributes to the sky, 0.0 where it
+        is excluded, NaN off-detector.
+
+        The hatch marks the EXCLUDED spaxels — the galaxy and whatever else the
+        vetoes removed — because that is the thing the user is deciding about.
+        An outline alone leaves "which side is in?" ambiguous on a mask with
+        several disconnected pieces, which is exactly the shape a stacked veto
+        produces.
+        """
+        self.clear_mask_preview()
+        if keep_field is None or getattr(self, 'ax', None) is None:
+            return
+        field = np.asarray(keep_field, dtype=float)
+        try:
+            # hatch.linewidth is consulted at DRAW time, not at creation, so it
+            # cannot be set-and-restored around the call; it is set once here.
+            # Nothing else in this app hatches.
+            plt.rcParams['hatch.linewidth'] = 0.6
+
+            excluded = np.where(np.isfinite(field), 1.0 - field, np.nan)
+            self._mask_excl_cs = self.ax.contourf(
+                excluded, levels=[0.5, 1.5], colors='none', hatches=['/////'])
+            # contourf draws filled polygons; we want only the hatch strokes.
+            try:
+                colls = self._mask_excl_cs.collections     # matplotlib < 3.8
+            except AttributeError:
+                colls = [self._mask_excl_cs]
+            for coll in colls:
+                coll.set_facecolor('none')
+                coll.set_edgecolor('#d32f2f')
+                # linewidth 0 suppresses the HATCH as well, not just the polygon
+                # outline — the Agg renderer paints the hatch as part of the edge
+                # stroke, so a zero-width edge draws nothing at all. Keep it thin
+                # and let the thin boundary stand; hatch.linewidth above controls
+                # the hatch strokes themselves.
+                coll.set_linewidth(0.5)
+
+            # Keep the cyan boundary as well: the hatch says which side is out,
+            # the contour says exactly where the edge is.
+            self._mask_preview_cs = self.ax.contour(
+                field, levels=[0.5], colors='#4fc3f7', linewidths=1.2)
+            self.canvas.draw_idle()
+        except Exception as e:
+            print(f"Sky-region preview failed: {type(e).__name__}: {e}")
+
     def clear_mask_preview(self):
         """Remove any mask-preview contour drawn by show_mask_preview."""
+        excl = getattr(self, '_mask_excl_cs', None)
+        if excl is not None:
+            try:
+                excl.remove()
+            except Exception:
+                try:
+                    for coll in excl.collections:
+                        coll.remove()
+                except Exception:
+                    pass
+            self._mask_excl_cs = None
         cs = getattr(self, '_mask_preview_cs', None)
         if cs is not None:
             try:
@@ -7847,9 +8014,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                        
                        
     def add_spectral_lines_button_header(self, grid_layout):
+        # The per-line 'SNR' column was removed: Mask Spaxels -> S/N tab now
+        # owns the S/N gate (same compute_snr_map, and 'any line, >' reproduces
+        # the old button's behaviour spaxel-for-spaxel), and exposes the line
+        # selection and all/any combination the buttons could not.
         button_columns = [
             'Line Name', 
-            'SNR',
             '<i>&lambda;</i><sub>rest</sub>', 
             '<i>f</i><sub>&lambda;,0</sub>', 
             '<i>f</i><sub>&lambda;,0,min</sub>', 
@@ -7913,7 +8083,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         df_region = df.loc[np.int64(df['region_ID']) == np.int64(regionID)]
         
         for row in range(df_region.shape[0]):
-            button_columns = ['Line_Name', 'SNR','Rest Wavelength', 
+            button_columns = ['Line_Name', 'Rest Wavelength', 
                               'Amp_0', 'Amp_0_lowlim', 'Amp_0_highlim',
                               'Centroid_0', 'Centroid_0_lowlim', 'Centroid_0_highlim',
                               'Sigma_0','Sigma_0_lowlim','Sigma_0_highlim',
@@ -8193,12 +8363,17 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # Insert an empty row to separate the sections
                 writer.writerow([])
                 
+                # Self-sky provenance rides in the units block so a corrected
+                # cube's fit can never be mistaken for an uncorrected one.
+                _ss = selfsky_provenance()
                 writer.writerow(['wavelength scale factor', 'flux scale factor',
-                                 'flux unit', 'wavelength unit', 'velocity unit'])
+                                 'flux unit', 'wavelength unit', 'velocity unit']
+                                + list(_ss.keys()))
 
                 writer.writerow([self.viewer_window.WLscalefactor,
                                  self.viewer_window.fluxscalefactor,
-                                 flux_unit_str(), 'Angstrom', 'km/s'])
+                                 flux_unit_str(), 'Angstrom', 'km/s']
+                                + list(_ss.values()))
     
                 # Insert an empty row to separate the sections
                 writer.writerow([])
@@ -8456,6 +8631,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.fix_fit_button              = QPushButton('Rectify Bad Fits')
         self.rchisq_map_button           = QPushButton('Quality Map ▾')
         self.mask_button                 = QPushButton('Mask…')
+        self.selfsky_button              = QPushButton('Self-Sky…')
         self.clear_all_fits_button       = QPushButton('Clear All Fits')
 
         self.smart_constraints_button.clicked.connect(self.open_smart_constraints_dialog)
@@ -8480,6 +8656,11 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             'Show a goodness-of-fit map: core/continuum ratio (≈1 good, ≫1 bad),\n'
             'signed-residual z (missed/over-subtracted flux), runs z (shape errors),\n'
             'calibrated continuum χ², or the native reduced χ²')
+        self.selfsky_button.clicked.connect(self.open_selfsky_dialog)
+        self.selfsky_button.setToolTip(
+            'Subtract a sky spectrum built from the cube\'s own object-free spaxels.\n'
+            'For additive sky residuals the reduction left behind — the kind the\n'
+            'fitter then finds in every spaxel. Non-destructive; Revert restores.')
         self.mask_button.clicked.connect(partial(self.mask_spaxels))
         self.mask_button.setToolTip(
             'Mask the displayed maps by any quality / line / stellar map criterion\n'
@@ -8492,7 +8673,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         for btn in [self.smart_constraints_button, self.meas_errors_button,
                     self.fit_cube_button, self.fix_fit_button,
-                    self.rchisq_map_button, self.mask_button, self.clear_all_fits_button]:
+                    self.rchisq_map_button, self.mask_button, self.selfsky_button,
+                    self.clear_all_fits_button]:
             btn.setFixedHeight(ui_px(28))
             row2.addWidget(btn)
 
@@ -9090,7 +9272,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             if _sm is not None and getattr(_sm, 'ndim', 0) == 2:
                 flagged = {(x, y) for (x, y) in flagged
                            if 0 <= y < _sm.shape[0] and 0 <= x < _sm.shape[1]
-                           and _sm[y, x] >= snr_value}
+                           and self._gate_allows(self.fit_gate(), x, y)}
             return flagged, n_tot, len(failed)
 
         def _refresh_count(*_):
@@ -9303,21 +9485,579 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 mask_array[y, x] = True  # in domain but fails → mask out
         return keep_field, mask_array
 
+
+    # ── Self-sky subtraction (SPEC: HyperCube_SelfSky_SPEC.md, Stage 4) ──────
+    def _selfsky_white_light(self):
+        """Cached continuum image for the current cube."""
+        key = id(SELFSKY_ORIG_CUBE if SELFSKY_ORIG_CUBE is not None else FITS_DATA)
+        cache = getattr(self, '_selfsky_wl_cache', None)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2]
+        base = SELFSKY_ORIG_CUBE if SELFSKY_ORIG_CUBE is not None else FITS_DATA
+        step = max(1, base.shape[0] // 400)     # ~400 planes is plenty for a median
+        wl = hcss.white_light(base, step=step)
+        live = hcss._live(base)
+        self._selfsky_wl_cache = (key, wl, live)
+        return wl, live
+
+    def _selfsky_veto_from_map(self, values, op, thresh):
+        """Boolean keep-mask from a {(x, y): value} map, matching Mask Spaxels.
+
+        Reuses the operator semantics of `_mask_keep_field` so the two features
+        cannot drift apart. Spaxels outside the map's domain (no fit there) are
+        KEPT: a spaxel the fit never reached is not evidence of an object, and
+        dropping it would shrink the sky pool for the wrong reason.
+        """
+        ny, nx = int(FITS_DATA.shape[-2]), int(FITS_DATA.shape[-1])
+        field = np.full((ny, nx), np.nan)
+        for (x, y), v in values.items():
+            if 0 <= y < ny and 0 <= x < nx:
+                field[y, x] = v
+        keep = hcss.threshold_mask(field, op, thresh)
+        return keep | ~np.isfinite(field)
+
+    def open_selfsky_dialog(self):
+        """Build a sky spectrum from the cube's own object-free spaxels and
+        subtract it.
+
+        For additive sky residuals only: a line the reduction left behind, which
+        the fitter then finds in every spaxel. The driver case is a 6866 A
+        residual sitting 2.1 A from [N II] 6548 and 2.5x brighter than it.
+
+        This is a workaround. For KCWI/KCRM the root cause is upstream --
+        SubtractSky scales the sky master by exposure time only and never fits
+        the airglow amplitude -- and correcting it at reduction time is better
+        for every downstream use.
+        """
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QComboBox, QDoubleSpinBox, QSpinBox,
+                                     QPushButton, QFrame, QMessageBox, QGridLayout,
+                                     QListWidget, QMenu, QInputDialog)
+
+        vw = self.viewer_window
+        if FITS_DATA is None or np.ndim(FITS_DATA) != 3:
+            QMessageBox.information(self, 'Self-Sky', 'Open a cube first.')
+            return
+
+        wl, live = self._selfsky_white_light()
+        n_live = max(int(live.sum()), 1)
+
+        # Modeless AND always-on-top: the user needs the main window live to move
+        # the C window / pick channels while this is open, but the panel must not
+        # disappear behind it. Qt.Tool floats above the application's own windows
+        # without the global always-on-top of WindowStaysOnTopHint.
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint |
+                           Qt.CustomizeWindowHint | Qt.WindowTitleHint |
+                           Qt.WindowCloseButtonHint)
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        dlg.setWindowTitle('Self-Sky Subtraction')
+        dlg.setMinimumWidth(ui_px(700))
+        lay = QVBoxLayout(dlg)
+
+        blurb = QLabel(
+            'Builds a sky spectrum from spaxels you mark as object-free and subtracts it.\n'
+            'For ADDITIVE residuals only — a sky line the reduction left behind. An artifact\n'
+            'that scales with the continuum (scattered light, flat-field) is a different bug.')
+        blurb.setStyleSheet(f'color: gray; {ui_font_css("small")}')
+        lay.addWidget(blurb)
+
+        # ── protected region (SPEC 2.5) ─────────────────────────────────────
+        prow = QGridLayout()
+        # The guard must NOT auto-fill from the live C window. Doing so made the
+        # tool reject the user's own workflow: open the dialog, add a channel-map
+        # veto from the C window that is still set, and the veto is refused for
+        # overlapping a "protected region" that was just copied from it. The
+        # guard starts EMPTY (zero width = off) and is armed deliberately.
+        prow.addWidget(QLabel('Artifact wavelengths:'), 0, 0)
+        p0 = QDoubleSpinBox(); p1 = QDoubleSpinBox()
+        for sb_ in (p0, p1):
+            sb_.setDecimals(2); sb_.setRange(0.0, 1e6); sb_.setSingleStep(0.5)
+            sb_.setValue(0.0)
+        b_setprot = QPushButton('← set from C window')
+        b_clrprot = QPushButton('Clear')
+        prow.addWidget(p0, 0, 1); prow.addWidget(QLabel('–'), 0, 2); prow.addWidget(p1, 0, 3)
+        prow.addWidget(b_setprot, 0, 4); prow.addWidget(b_clrprot, 0, 5)
+        hint = QLabel('Optional. Set this to where the ARTIFACT is, then a veto built on '
+                      'those same\nwavelengths is refused as circular. Leave at 0 to disable '
+                      'the check.')
+        hint.setStyleSheet(f'color: gray; {ui_font_css("small")}')
+        prow.addWidget(hint, 1, 0, 1, 6)
+        lay.addLayout(prow)
+
+        # ── veto stack ──────────────────────────────────────────────────────
+        lay.addWidget(QLabel('Sky region — spaxels surviving EVERY veto:'))
+        vlist = QListWidget(); vlist.setMinimumHeight(ui_px(110))
+        lay.addWidget(vlist)
+
+        vrow = QHBoxLayout()
+        b_add = QPushButton('Add veto ▾')
+        b_del = QPushButton('Remove')
+        vrow.addWidget(b_add); vrow.addWidget(b_del); vrow.addStretch()
+        lay.addLayout(vrow)
+
+        vetoes = []          # list of dicts: {label, mask}
+
+        # ── statistic / mode ────────────────────────────────────────────────
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Statistic:'))
+        stat = QComboBox(); stat.addItems(list(hcss.STATISTIC_NAMES))
+        stat.setToolTip('Median by default. A mean is deliberately unavailable:\n'
+                        'the median is what keeps an imperfect mask harmless.')
+        row.addWidget(stat)
+        row.addSpacing(ui_px(12))
+        row.addWidget(QLabel('Mode:'))
+        mode = QComboBox(); mode.addItems(['global', 'per-column'])
+        mode.setToolTip('per-column tracks an across-slice gradient in the residual\n'
+                        '(the DRP models sky per slice), at the cost of a smaller\n'
+                        'pool per block.')
+        row.addWidget(mode)
+        nblk = QSpinBox(); nblk.setRange(2, 32); nblk.setValue(hcss.DEFAULT_COL_BLOCKS)
+        nblk.setPrefix('blocks '); nblk.setEnabled(False)
+        row.addWidget(nblk); row.addStretch()
+        lay.addLayout(row)
+        mode.currentTextChanged.connect(lambda t: nblk.setEnabled(t == 'per-column'))
+
+        count = QLabel(''); count.setStyleSheet('font-weight: bold;')
+        lay.addWidget(count)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); lay.addWidget(sep)
+
+        btns = QHBoxLayout()
+        b_prev = QPushButton('Preview region')
+        b_apply = QPushButton('Apply')
+        b_revert = QPushButton('Revert')
+        b_export = QPushButton('Export sky…')
+        b_close = QPushButton('Close')
+        for b in (b_prev, b_apply, b_revert, b_export, b_close):
+            btns.addWidget(b)
+        lay.addLayout(btns)
+
+        def _protected():
+            lo, hi = sorted((p0.value(), p1.value()))
+            return None if hi - lo <= 0 else (lo, hi)
+
+        def _set_protected_from_c():
+            w0 = getattr(vw, '_chanmap_wav0', None)
+            w1 = getattr(vw, '_chanmap_wav1', None)
+            if w0 is None or w1 is None:
+                QMessageBox.information(
+                    self, 'Self-Sky',
+                    'No channel map is set. Hold C and drag across the artifact in '
+                    'the spectrum, then press this again.')
+                return
+            lo, hi = sorted((float(w0), float(w1)))
+            p0.setValue(lo); p1.setValue(hi)
+
+        def _clear_protected():
+            p0.setValue(0.0); p1.setValue(0.0)
+
+        b_setprot.clicked.connect(_set_protected_from_c)
+        b_clrprot.clicked.connect(_clear_protected)
+
+        def _combined():
+            if not vetoes:
+                return None
+            return hcss.combine_masks(*[v['mask'] for v in vetoes])
+
+        def _refresh(*_):
+            vlist.clear()
+            for v in vetoes:
+                vlist.addItem(f"{v['label']}   →  keeps {int(v['mask'].sum())}")
+            m = _combined()
+            nsel = 0 if m is None else int(m.sum())
+            ok = nsel >= hcss.DEFAULT_MIN_SPAXELS
+            if m is None:
+                count.setText('No vetoes yet — add at least one.')
+            else:
+                count.setText(f'{nsel} spaxels survive all {len(vetoes)} veto(es) '
+                              f'({100.0 * nsel / n_live:.0f}% of live)'
+                              + ('' if ok else f'  — below the floor of '
+                                               f'{hcss.DEFAULT_MIN_SPAXELS}, Apply disabled'))
+            count.setStyleSheet('font-weight: bold; color: %s'
+                                % ('#2e7d32' if ok else '#c62828'))
+            b_apply.setEnabled(ok)
+            b_del.setEnabled(bool(vetoes))
+
+        # ── veto builders ───────────────────────────────────────────────────
+        def _add_faintest():
+            pct, ok = QInputDialog.getDouble(dlg, 'Faintest N%',
+                                             'Keep the faintest N% by white light:',
+                                             60.0, 1.0, 99.0, 0)
+            if not ok:
+                return
+            vetoes.append({'label': f'faintest {pct:.0f}% white light',
+                           'mask': hcss.faintest_fraction_mask(wl, pct / 100.0, live=live)})
+            _refresh()
+
+        def _add_wl_threshold():
+            finite = wl[live & np.isfinite(wl)]
+            default = float(np.percentile(finite, 60)) if finite.size else 0.0
+            val, ok = QInputDialog.getDouble(dlg, 'White light below',
+                                             'Keep spaxels with white light <',
+                                             default, -1e9, 1e9, 6)
+            if not ok:
+                return
+            vetoes.append({'label': f'white light < {val:.6g}',
+                           'mask': hcss.threshold_mask(wl, '<', val, live=live)})
+            _refresh()
+
+        def _add_channel_map():
+            """Veto on the current C window minus the locked X/V sidebands."""
+            w0 = getattr(vw, '_chanmap_wav0', None)
+            w1 = getattr(vw, '_chanmap_wav1', None)
+            if w0 is None or w1 is None:
+                QMessageBox.information(
+                    self, 'Self-Sky',
+                    'No channel map is defined. Hold C and drag across a galaxy or '
+                    'outflow line in the spectrum first (lock X/V windows either '
+                    'side for continuum subtraction), then add the veto.')
+                return
+            try:
+                hcss.check_veto_window((w0, w1), _protected())
+            except hcss.VetoWindowOverlap as exc:
+                QMessageBox.warning(
+                    self, 'Self-Sky — circular veto',
+                    str(exc) + '\n\nIf the artifact field above is wrong, clear it '
+                               'or set it to the artifact rather than to this line.')
+                return
+            sidebands = []
+            for _k, sm in getattr(vw, '_submap', {}).items():
+                if sm.get('locked') and sm.get('span') is not None:
+                    sidebands.append(vw._span_x_extent(sm['span']))
+            try:
+                # Always the pristine cube: a veto built on an already-corrected
+                # cube would change meaning depending on what was applied first,
+                # so the same clicks would not reproduce the same mask.
+                _base = (SELFSKY_ORIG_CUBE if SELFSKY_ORIG_CUBE is not None
+                         else FITS_DATA)
+                cm = hcss.channel_map(_base, wavelengths, w0, w1, sidebands)
+            except ValueError as exc:
+                QMessageBox.warning(self, 'Self-Sky', str(exc)); return
+            finite = cm[live & np.isfinite(cm)]
+            default = float(np.percentile(finite, 70)) if finite.size else 0.0
+            pcts = (np.percentile(finite, [50, 70, 90, 95]) if finite.size
+                    else [0, 0, 0, 0])
+            val, ok = QInputDialog.getDouble(
+                dlg, 'Channel-map veto',
+                f'Channel map {w0:.2f}–{w1:.2f} A'
+                + (f' minus {len(sidebands)} sideband(s)'
+                   if sidebands else '  (no X/V sidebands locked — carries continuum)')
+                + f'\nmap percentiles:  p50 {pcts[0]:.4g}   p70 {pcts[1]:.4g}   '
+                  f'p90 {pcts[2]:.4g}   p95 {pcts[3]:.4g}'
+                + '\n\nKeep spaxels with map value <', default, -1e30, 1e30, 6)
+            if not ok:
+                return
+            vetoes.append({'label': f'chanmap {w0:.1f}–{w1:.1f} < {val:.4g}',
+                           'mask': hcss.threshold_mask(cm, '<', val, live=live)})
+            _refresh()
+
+        def _add_fit_map():
+            """Veto on any fitted line / quality map (the Mask Spaxels sources)."""
+            maps = self._rectify_available_maps()
+            if not maps:
+                QMessageBox.information(
+                    self, 'Self-Sky',
+                    'No fit maps yet. Fit the cube first, or use a channel-map veto.')
+                return
+            labels = [m['label'] for m in maps]
+            lab, ok = QInputDialog.getItem(dlg, 'Fit-map veto', 'Map:', labels, 0, False)
+            if not ok:
+                return
+            m = maps[labels.index(lab)]
+            ops = ['<', '>', 'abs<', 'abs>']
+            op, ok = QInputDialog.getItem(dlg, 'Fit-map veto', 'Keep spaxels where value',
+                                          ops, ops.index(m.get('default_op', '<'))
+                                          if m.get('default_op') in ops else 0, False)
+            if not ok:
+                return
+            val, ok = QInputDialog.getDouble(dlg, 'Fit-map veto', f'{lab}  {op}',
+                                             float(m.get('default_thr', 0.0)),
+                                             -1e30, 1e30, 6)
+            if not ok:
+                return
+            vetoes.append({'label': f'{lab} {op} {val:.4g}',
+                           'mask': self._selfsky_veto_from_map(m['values'], op, val)})
+            _refresh()
+
+        def _add_menu():
+            menu = QMenu(dlg)
+            menu.addAction('Faintest N% by white light', _add_faintest)
+            menu.addAction('White light below value…', _add_wl_threshold)
+            menu.addSeparator()
+            menu.addAction('Channel map (current C window)…', _add_channel_map)
+            menu.addAction('Fitted line / quality map…', _add_fit_map)
+            menu.exec_(b_add.mapToGlobal(b_add.rect().bottomLeft()))
+
+        def _remove():
+            i = vlist.currentRow()
+            if 0 <= i < len(vetoes):
+                vetoes.pop(i); _refresh()
+
+        def _preview():
+            m = _combined()
+            if m is None:
+                QMessageBox.information(self, 'Self-Sky', 'Add a veto first.'); return
+            vw.show_sky_region_preview(np.where(live, m.astype(float), np.nan))
+
+        def _apply():
+            m = _combined()
+            if m is None:
+                return
+            base = SELFSKY_ORIG_CUBE if SELFSKY_ORIG_CUBE is not None else FITS_DATA
+            base_sig = SELFSKY_ORIG_SIGMA if SELFSKY_ORIG_CUBE is not None else ERROR_CUBE
+            try:
+                res = hcss.build_sky(base, m,
+                                     statistic=stat.currentText(),
+                                     mode=mode.currentText(),
+                                     n_col_blocks=nblk.value(),
+                                     mask_sources=tuple(v['label'] for v in vetoes),
+                                     wav_guard=_protected())
+            except hcss.SkyPoolTooSmall as exc:
+                QMessageBox.warning(self, 'Self-Sky', str(exc)); return
+            corrected = hcss.apply_sky(base, res)
+            sigma = hcss.propagate_sky_variance(base_sig, res, np.shape(base))
+            info = {'selfsky_applied': True,
+                    'selfsky_statistic': res.statistic,
+                    'selfsky_mode': res.mode,
+                    'selfsky_n_mask': res.n_mask,
+                    'selfsky_sources': ' AND '.join(res.mask_sources),
+                    'selfsky_fallback_cols': len(res.fallback_cols)}
+            apply_selfsky(corrected, sigma, res, m, info)
+            vw.fits_data = corrected
+            vw.clear_mask_preview()
+            vw.redraw_current_image()
+            self._selfsky_sync_title()
+            msg = res.describe()
+            if res.fallback_cols:
+                msg += (f'\n{len(res.fallback_cols)} column block(s) had too few '
+                        f'spaxels and fell back to the global sky.')
+            QMessageBox.information(self, 'Self-Sky', 'Applied.\n\n' + msg)
+            _refresh_buttons()
+
+        def _revert():
+            if not revert_selfsky():
+                QMessageBox.information(self, 'Self-Sky', 'No correction is active.')
+                return
+            vw.fits_data = FITS_DATA
+            vw.clear_mask_preview()
+            vw.redraw_current_image()
+            self._selfsky_sync_title()
+            _refresh_buttons()
+
+        def _export():
+            if not selfsky_active():
+                QMessageBox.information(self, 'Self-Sky', 'Apply a correction first.')
+                return
+            path, _sel = QFileDialog.getSaveFileName(
+                self, 'Export sky spectrum', '', 'CSV (*.csv);;All Files (*)')
+            if not path:
+                return
+            if not path.endswith('.csv'):
+                path += '.csv'
+            res = SELFSKY_RESULT
+            with open(path, 'w', newline='') as fh:
+                w_ = csv.writer(fh)
+                w_.writerow(['# HyperCube self-sky spectrum'])
+                for k, v in SELFSKY_INFO.items():
+                    w_.writerow([f'# {k}', v])
+                w_.writerow(['# flux unit', flux_unit_str()])
+                w_.writerow([])
+                if res.mode == 'global':
+                    w_.writerow(['wavelength_A', 'sky_flux', 'sky_sigma'])
+                    for i, lam in enumerate(wavelengths):
+                        w_.writerow([lam, res.sky[i], float(np.sqrt(res.sky_var[i]))])
+                else:
+                    w_.writerow(['wavelength_A']
+                                + [f'block{b}_flux' for b in range(res.sky.shape[1])])
+                    for i, lam in enumerate(wavelengths):
+                        w_.writerow([lam] + list(res.sky[i]))
+            QMessageBox.information(self, 'Self-Sky', f'Wrote {path}')
+
+        def _refresh_buttons():
+            b_revert.setEnabled(selfsky_active())
+            b_export.setEnabled(selfsky_active())
+
+        b_add.clicked.connect(_add_menu)
+        b_del.clicked.connect(_remove)
+        b_prev.clicked.connect(_preview)
+        b_apply.clicked.connect(_apply)
+        b_revert.clicked.connect(_revert)
+        b_export.clicked.connect(_export)
+        b_close.clicked.connect(dlg.close)
+
+        _refresh(); _refresh_buttons()
+        dlg.show()
+
+    def _selfsky_sync_title(self):
+        """Keep the active correction visible — a corrected cube must never look
+        like an uncorrected one."""
+        vw = self.viewer_window
+        base = getattr(vw, '_base_window_title', None)
+        if base is None:
+            base = vw.windowTitle()
+            vw._base_window_title = base
+        vw.setWindowTitle(base + ('  [self-sky subtracted]' if selfsky_active() else ''))
+
+    CHANMAP_MASK_LABEL = 'C-region (channel map)'
+
+    def _chanmap_mask_source(self):
+        """A `_rectify_available_maps`-shaped entry for the current C window.
+
+        Built fresh on every call, never cached: the dialog is modeless, so the
+        user is expected to move the C window and re-lock X/V sidebands while it
+        is open, and a cached map would silently mask on a stale selection.
+
+        Returns None (with a reason) when no C window is set.
+        """
+        vw = self.viewer_window
+        w0 = getattr(vw, '_chanmap_wav0', None)
+        w1 = getattr(vw, '_chanmap_wav1', None)
+        if w0 is None or w1 is None or wavelengths is None or FITS_DATA is None:
+            return None, ('No channel map is set. Hold C and drag across a line '
+                          'in the spectrum (lock X/V windows either side for '
+                          'continuum subtraction), then re-select this option.')
+        sidebands = []
+        for _k, sm in getattr(vw, '_submap', {}).items():
+            if sm.get('locked') and sm.get('span') is not None:
+                try:
+                    sidebands.append(vw._span_x_extent(sm['span']))
+                except Exception:
+                    pass
+        try:
+            cm = hcss.channel_map(FITS_DATA, wavelengths, w0, w1, sidebands)
+        except Exception as e:
+            return None, f'Channel map failed: {type(e).__name__}: {e}'
+        live = hcss._live(FITS_DATA)
+        vals = {}
+        ny, nx = cm.shape
+        for y in range(ny):
+            for x in range(nx):
+                if live[y, x] and np.isfinite(cm[y, x]):
+                    vals[(x, y)] = float(cm[y, x])
+        if not vals:
+            return None, 'The channel map has no valid spaxels.'
+        arr = np.fromiter(vals.values(), dtype=float)
+        # Spell the separators out: '6873.36-6906.98 A-2 sideband(s)' reads as
+        # though the sidebands were being subtracted from a wavelength.
+        sb_txt = (f', {len(sidebands)} sideband(s)' if sidebands
+                  else ', no sidebands (carries continuum)')
+        return {'label': f'{self.CHANMAP_MASK_LABEL}  '
+                         f'[{w0:.2f} to {w1:.2f} A{sb_txt}]',
+                'values': vals,
+                'signed': True,
+                'default_op': '>',
+                'default_thr': float(np.percentile(arr, 70))}, None
+
+    def fit_gate(self):
+        """(ny, nx) bool — spaxels the cube fit is allowed to touch, or None.
+
+        TWO independent gates, ANDed:
+
+        * the S/N threshold (`snr_map >= snr_value`) — the pre-fit gate set from
+          a line's S/N button in the Spectral Region tab;
+        * the spaxel mask from **Mask Spaxels** — whatever the user has masked
+          out is not fitted either.
+
+        The second is a deliberate change of meaning: the mask used to be
+        display-only. Fitting spaxels the user has explicitly hidden wastes the
+        expensive part of the run on data they have already rejected, and then
+        writes fit rows for them. Anything masked is now out of scope for the
+        fit as well.
+
+        Both arrays are (ny, nx) — `_mask_keep_field` builds its mask from
+        `FITS_DATA.shape[-2:]` and `compute_snr_map` returns the same shape, so
+        they align without transposing.
+        """
+        gate = None
+        smap = globals().get('snr_map', None)
+        if smap is not None:
+            try:
+                gate = np.asarray(smap) >= snr_value
+            except Exception:
+                gate = None
+        sm = getattr(self.viewer_window, '_spaxel_mask', None)
+        if sm is not None:
+            try:
+                keep = ~np.asarray(sm, dtype=bool)   # _spaxel_mask: True = hidden
+                gate = keep if gate is None else (gate & keep)
+            except Exception:
+                pass
+        return gate
+
+    def _gate_allows(self, gate, i, j):
+        """Is spaxel (x=i, y=j) fittable under `gate`? True when ungated."""
+        if gate is None:
+            return True
+        try:
+            return bool(gate[j, i])
+        except Exception:
+            return True
+
+    def _snr_mask_lines(self):
+        """[(row_index, label, centroid)] for every line in the model."""
+        out = []
+        if df is None or not len(df):
+            return out
+        try:
+            cens = pd.to_numeric(df['Centroid_0'], errors='coerce')
+        except Exception:
+            return out
+        names = df['Line_Name'].astype(str) if 'Line_Name' in df.columns else None
+        regs = df['region_ID'].astype(str) if 'region_ID' in df.columns else None
+        for i, c in enumerate(cens):
+            if not np.isfinite(c):
+                continue
+            nm = names.iloc[i] if names is not None else f'line {i}'
+            rg = f'  (r{regs.iloc[i]})' if regs is not None else ''
+            out.append((i, f'{nm}{rg}', float(c)))
+        return out
+
+    def _snr_per_line_maps(self, centroids):
+        """Per-line S/N maps for the given centroids, via the shared function."""
+        d_lam = float(np.median(np.diff(np.asarray(wavelengths, dtype=float))))
+        return compute_snr_map(FITS_DATA, wavelengths, centroids,
+                               50 * d_lam, 60 * d_lam, 70 * d_lam, per_line=True)
+
     def mask_spaxels(self):
-        """Mask the displayed maps by an arbitrary map criterion: keep spaxels
-        that satisfy it, hide the rest. Preview as a contour (like the SNR mask),
-        then Accept; Unmask clears any active mask."""
+        """Two-tab spatial mask over the cube: keep spaxels that satisfy a
+        criterion, hide the rest, and exclude the rest from cube fits.
+
+        Tab 1 "Map criterion" — any single fitted line / quality / stellar map,
+        or the live C-region channel map, with one operator and one value.
+        Tab 2 "S/N" — per-line emission-line S/N, each line with its own
+        threshold, combined with any/all.
+
+        S/N lives ONLY in tab 2. Offering it in tab 1 as well would give two
+        routes to the same cut, one of which cannot express per-line thresholds
+        — which is how the old per-line SNR buttons became confusing.
+
+        Preview hatches the masked-out region in red; Accept applies; Unmask
+        clears the mask and the S/N gate together.
+        """
         from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                      QComboBox, QDoubleSpinBox, QPushButton,
-                                     QFrame, QMessageBox)
+                                     QFrame, QMessageBox, QTabWidget, QWidget,
+                                     QListWidget, QListWidgetItem, QRadioButton,
+                                     QButtonGroup, QTableWidget, QTableWidgetItem,
+                                     QHeaderView, QAbstractItemView)
 
         vw = self.viewer_window
 
         maps = self._rectify_available_maps()
-        if not maps:
-            QMessageBox.information(self, 'Mask Spaxels',
-                                    'No maps found. Fit the cube first so there '
-                                    'are quality / line / stellar maps to mask on.')
+        # The channel map needs no fit, so it is offered even when nothing has
+        # been fitted yet — that is the whole point of having it here.
+        # S/N deliberately does NOT appear here — it lives in the S/N tab,
+        # which offers per-line thresholds and an any/all combiner that a single
+        # map + operator + value cannot express. Two routes to the same cut, one
+        # of them strictly weaker, is how the old per-line SNR buttons became
+        # confusing in the first place.
+        maps = list(maps) + [{'label': self.CHANMAP_MASK_LABEL, 'values': {},
+                              'signed': True, 'default_op': '>',
+                              'default_thr': 0.0, '_chanmap': True}]
+        if FITS_DATA is None:
+            QMessageBox.information(self, 'Mask Spaxels', 'Open a cube first.')
             return
 
         OPS = [('>',     '>'),
@@ -9326,11 +10066,27 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                ('|·| <', 'abs<')]
 
         dlg = QDialog(self)
+        # Modeless and floating: the user needs the main window live to move the
+        # C window, re-lock X/V sidebands and read fluxes off the map while this
+        # is open. Qt.Tool floats above the app's own windows without the global
+        # always-on-top of a bare WindowStaysOnTopHint.
+        dlg.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint |
+                           Qt.CustomizeWindowHint | Qt.WindowTitleHint |
+                           Qt.WindowCloseButtonHint)
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_ShowWithoutActivating, True)
         dlg.setWindowTitle('Mask Spaxels')
-        dlg.setMinimumWidth(ui_px(470))
-        layout = QVBoxLayout(dlg)
+        dlg.setMinimumWidth(ui_px(520))
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(10, 10, 10, 10)
+        tabs = QTabWidget()
+        outer.addWidget(tabs)
+
+        map_tab = QWidget()
+        layout = QVBoxLayout(map_tab)
         layout.setSpacing(10)
         layout.setContentsMargins(14, 14, 14, 14)
+        tabs.addTab(map_tab, 'Map criterion')
 
         # ── Row: "Keep spaxels where: [map combo]" ────────────────────────
         map_row = QHBoxLayout()
@@ -9349,9 +10105,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             op_combo.addItem(disp)
         thresh_row.addWidget(op_combo)
         spin = QDoubleSpinBox()
-        spin.setRange(-1e6, 1e6)
-        spin.setDecimals(3)
-        spin.setSingleStep(0.5)
+        # Range/precision are set per map by _tune_spin_for(); these are only
+        # placeholders. A fixed 3 decimals silently truncated every faint map:
+        # a channel-map threshold of -0.015317 became -0.015, and line-amplitude
+        # maps in 1e-16 cgs live at 1e-3 and below, where 3 decimals is one or
+        # two significant figures.
+        spin.setRange(-1e12, 1e12)
+        spin.setDecimals(6)
+        spin.setSingleStep(0.001)
+        spin.setMinimumWidth(ui_px(150))
         thresh_row.addWidget(spin)
         thresh_row.addStretch()
         layout.addLayout(thresh_row)
@@ -9361,12 +10123,50 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         preview.setWordWrap(True)
         layout.addWidget(preview)
 
-        def _current():
+        def _tune_spin_for(m):
+            """Match the threshold box's precision and step to this map's scale.
+
+            One fixed precision cannot serve maps whose values span velocity in
+            km/s (hundreds), reduced chi-square (order 1) and line amplitudes in
+            1e-16 cgs (1e-3 and below). Decimals are chosen to resolve ~1e-5 of
+            the map's own 1-99 percentile span, floored at the previous 3 so
+            nothing loses precision relative to the old behaviour.
+            """
+            import math
+            vals = np.fromiter(m['values'].values(), dtype=float) if m.get('values') else None
+            if vals is None or vals.size == 0:
+                return
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                return
+            lo, hi = np.percentile(vals, [1, 99])
+            span = float(hi - lo)
+            if not np.isfinite(span) or span <= 0:
+                span = float(np.max(np.abs(vals))) or 1.0
+            dec = int(np.clip(5 - math.floor(math.log10(abs(span))), 3, 12))
+            spin.blockSignals(True)
+            spin.setDecimals(dec)
+            spin.setSingleStep(max(abs(span) / 100.0, 10.0 ** (-dec)))
+            lim = max(float(np.max(np.abs(vals))) * 10.0, 1e3)
+            spin.setRange(-lim, lim)
+            spin.blockSignals(False)
+
+        def _current(announce=False):
             midx = map_combo.currentIndex()
             oidx = op_combo.currentIndex()
             if not (0 <= midx < len(maps)) or not (0 <= oidx < len(OPS)):
                 return None
-            return maps[midx], OPS[oidx][1]
+            m = maps[midx]
+            if m.get('_chanmap'):
+                live_m, why = self._chanmap_mask_source()
+                if live_m is None:
+                    if announce:
+                        QMessageBox.information(self, 'Mask Spaxels', why)
+                    else:
+                        preview.setText(f'<i>{why}</i>')
+                    return None
+                return live_m, OPS[oidx][1]
+            return m, OPS[oidx][1]
 
         def _refresh(*_):
             cur = _current()
@@ -9388,6 +10188,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         def _on_map_changed(midx):
             if 0 <= midx < len(maps):
                 m = maps[midx]
+                if m.get('_chanmap'):
+                    # Its default threshold depends on the CURRENT C window, so
+                    # resolve it now rather than using the placeholder's 0.0.
+                    live_m, _why = self._chanmap_mask_source()
+                    if live_m is not None:
+                        m = live_m
+                _tune_spin_for(m)          # precision before the value is set
                 tok_to_idx = {tok: i for i, (_d, tok) in enumerate(OPS)}
                 op_combo.blockSignals(True)
                 op_combo.setCurrentIndex(tok_to_idx.get(m['default_op'], 0))
@@ -9410,26 +10217,210 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         HELP = (
             "<b>Mask Spaxels</b> hides spaxels on every displayed map so you can "
             "focus on the region you care about (e.g. only well-fit spaxels, or "
-            "only a velocity range). It is a display mask — it does not change "
-            "the fit.<br><br>"
+            "only a velocity range). Masked spaxels are also <b>excluded from "
+            "cube fits</b> — fitting spaxels you have hidden would spend the "
+            "expensive part of a run on data you already rejected.<br><br>"
             "<b>Keep spaxels where …</b> defines the criterion the kept spaxels "
             "<i>satisfy</i>; every other spaxel in that map is masked out. Pick "
             "any quality metric, emission-line parameter (amplitude, centroid, "
             "velocity, σ), or stellar map, then an operator and threshold — "
             "exactly as in Rectify.<br><br>"
+            "<b>Masking on S/N?</b> That is the <b>S/N</b> tab, not this one: it "
+            "gives each line its own threshold and an any/all combiner, which a "
+            "single map and value here cannot express.<br><br>"
             "<b>Operators.</b> The threshold is signed:<br>"
             "&nbsp;&nbsp;<b>&gt; T</b> / <b>&lt; T</b> — keep values above / below T "
             "(T may be negative, e.g. keep <i>vel &gt; −300</i>)<br>"
             "&nbsp;&nbsp;<b>|·| &gt; T</b> / <b>|·| &lt; T</b> — keep by magnitude "
             "(e.g. keep <i>|vel| &lt; 300</i> to mask high-velocity outliers)<br><br>"
-            "<b>Buttons.</b> <i>Visualize</i> outlines the kept region as a cyan "
-            "contour (like the SNR mask) without applying it. <i>Accept mask</i> "
+            "<b>C-region (channel map).</b> Masks on the band defined by the "
+            "current <b>C</b> window minus any locked <b>X/V</b> sidebands — the "
+            "same map the C key draws. It needs no fit, so it is available "
+            "immediately, and it is re-read from the live selection every time, "
+            "so you can move the C window with this dialog open and just press "
+            "<i>Visualize</i> again.<br><br>"
+            "<b>Buttons.</b> <i>Visualize</i> previews without applying: the "
+            "masked-out region is hatched in red, with a cyan outline on the "
+            "boundary. <i>Accept mask</i> "
             "applies it to the display. <i>Unmask</i> clears any active mask. "
             "<i>Cancel</i> closes and removes the preview, leaving any existing "
             "mask untouched.<br><br>"
             "Spaxels with no value in the chosen map (e.g. unfit) keep their "
             "current visibility."
         )
+
+        # ══ Tab 2: S/N ═══════════════════════════════════════════════════
+        snr_tab = QWidget()
+        slay = QVBoxLayout(snr_tab)
+        slay.setSpacing(8)
+        slay.setContentsMargins(14, 14, 14, 14)
+        tabs.addTab(snr_tab, 'S/N')
+
+        snr_lines = self._snr_mask_lines()
+        slay.addWidget(QLabel('Keep spaxels whose line S/N satisfies:'))
+
+        # One threshold PER LINE: a single universal cut is wrong whenever the
+        # lines differ in brightness, which is the normal case ([O III] 4959 is
+        # a third of 5007 by atomic physics alone, so any cut that keeps 4959
+        # is far too lax for 5007).
+        line_tbl = QTableWidget(len(snr_lines), 3)
+        line_tbl.setHorizontalHeaderLabels(['Line', '\u03bb (\u00c5)', 'S/N threshold'])
+        line_tbl.verticalHeader().setVisible(False)
+        line_tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        line_tbl.setSelectionMode(QAbstractItemView.NoSelection)
+        line_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        line_tbl.setMinimumHeight(ui_px(150))
+        _default_thr = _safe_float(snr_value)
+        if not np.isfinite(_default_thr) or _default_thr <= 0:
+            _default_thr = 3.0
+        snr_spins = []
+        for r, (_i, lbl, cen) in enumerate(snr_lines):
+            it = QTableWidgetItem(lbl)
+            it.setFlags((it.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            it.setCheckState(Qt.Checked)
+            line_tbl.setItem(r, 0, it)
+            wl_it = QTableWidgetItem(f'{cen:.2f}')
+            wl_it.setFlags(Qt.ItemIsEnabled)
+            line_tbl.setItem(r, 1, wl_it)
+            sp = QDoubleSpinBox()
+            sp.setRange(-1e9, 1e9)
+            sp.setDecimals(3)
+            sp.setSingleStep(0.5)
+            sp.setValue(_default_thr)
+            line_tbl.setCellWidget(r, 2, sp)
+            snr_spins.append(sp)
+        slay.addWidget(line_tbl)
+
+        setall_row = QHBoxLayout()
+        setall_row.addWidget(QLabel('Set all thresholds to:'))
+        setall_spin = QDoubleSpinBox()
+        setall_spin.setRange(-1e9, 1e9); setall_spin.setDecimals(3)
+        setall_spin.setSingleStep(0.5); setall_spin.setValue(_default_thr)
+        setall_row.addWidget(setall_spin)
+        setall_btn = QPushButton('Apply to all')
+        setall_row.addWidget(setall_btn)
+        setall_row.addStretch()
+        slay.addLayout(setall_row)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel('Keep where  S/N'))
+        snr_op = QComboBox()
+        snr_op.setFixedWidth(ui_px(80))
+        for disp, _tok in OPS:
+            snr_op.addItem(disp)
+        srow.addWidget(snr_op)
+        srow.addWidget(QLabel('its own threshold, in'))
+        rb_any = QRadioButton('any line')
+        rb_all = QRadioButton('all lines')
+        rb_any.setChecked(True)          # reproduces the old per-line behaviour
+        grp = QButtonGroup(dlg)
+        grp.addButton(rb_any); grp.addButton(rb_all)
+        srow.addWidget(rb_any); srow.addWidget(rb_all)
+        srow.addStretch()
+        snr_help_btn = QPushButton('?')
+        snr_help_btn.setFixedWidth(ui_px(28))
+        snr_help_btn.setToolTip('How S/N is measured, and what all / any mean')
+        snr_help_btn.clicked.connect(
+            lambda: QMessageBox.information(dlg, 'S/N mask \u2014 Help',
+                                            self.SNR_MASK_HELP))
+        srow.addWidget(snr_help_btn)
+        slay.addLayout(srow)
+
+        snr_preview = QLabel()
+        snr_preview.setWordWrap(True)
+        slay.addWidget(snr_preview)
+        slay.addStretch()
+
+        _snr_cache = {'key': None, 'maps': None}
+
+        def _snr_checked():
+            """[(label, centroid, threshold)] for every ticked line."""
+            out = []
+            for row_i, (_i, lbl, cen) in enumerate(snr_lines):
+                it = line_tbl.item(row_i, 0)
+                if it is not None and it.checkState() == Qt.Checked:
+                    out.append((lbl, cen, float(snr_spins[row_i].value())))
+            return out
+
+        def _snr_keep_mask():
+            """(keep_bool (ny,nx), combined_snr_map, note) or (None, None, why).
+
+            Cached on the set of centroids: S/N touches every spaxel x every
+            line, and the user toggles the operator and threshold far more often
+            than the line selection.
+            """
+            if FITS_DATA is None or wavelengths is None:
+                return None, None, 'Open a cube first.'
+            picked = _snr_checked()
+            if not picked:
+                return None, None, ('No lines ticked. Tick at least one line, or '
+                                    'define lines in the model first.')
+            cens = [c for _l, c, _t in picked]
+            thrs = [t for _l, _c, t in picked]
+            # Cache on the CENTROIDS only: the maps do not depend on the
+            # thresholds, and the user moves thresholds constantly.
+            key = tuple(np.round(cens, 6))
+            if _snr_cache['key'] != key:
+                try:
+                    _snr_cache['maps'] = self._snr_per_line_maps(cens)
+                    _snr_cache['key'] = key
+                except Exception as e:
+                    return None, None, f'S/N could not be computed: {e}'
+            maps = _snr_cache['maps']
+            if not maps:
+                return None, None, 'No usable S/N maps for the ticked lines.'
+            tok = OPS[snr_op.currentIndex()][1]
+            tests = []
+            for m, thr in zip(maps, thrs):
+                a = np.asarray(m, dtype=float)
+                if tok == '>':
+                    tests.append(a > thr)
+                elif tok == '<':
+                    tests.append(a < thr)
+                elif tok == 'abs>':
+                    tests.append(np.abs(a) > thr)
+                else:
+                    tests.append(np.abs(a) < thr)
+            stack = np.stack(tests, axis=0)
+            keep = stack.all(axis=0) if rb_all.isChecked() else stack.any(axis=0)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                combined = np.nanmax(np.stack([np.asarray(m, float) for m in maps],
+                                              axis=0), axis=0)
+            return keep, combined, None
+
+        def _snr_refresh(*_):
+            keep, _comb, why = _snr_keep_mask()
+            if keep is None:
+                snr_preview.setText(f'<i>{why}</i>')
+                return
+            live = hcss._live(FITS_DATA)
+            nk = int((keep & live).sum())
+            nt = int(live.sum())
+            mode = 'all' if rb_all.isChecked() else 'any'
+            picked = _snr_checked()
+            thrs = sorted({t for _l, _c, t in picked})
+            thr_txt = (f'{thrs[0]:g}' if len(thrs) == 1
+                       else f'{thrs[0]:g}\u2013{thrs[-1]:g}, per line')
+            snr_preview.setText(
+                f"Keep <b>{nk}</b> of <b>{nt}</b> spaxels "
+                f"(S/N {OPS[snr_op.currentIndex()][0]} {thr_txt} in "
+                f"<b>{mode}</b> of {len(picked)} ticked line(s)); "
+                f"mask out <b>{nt - nk}</b>.")
+
+        def _set_all():
+            v = setall_spin.value()
+            for sp in snr_spins:
+                sp.blockSignals(True); sp.setValue(v); sp.blockSignals(False)
+            _snr_refresh()
+
+        setall_btn.clicked.connect(_set_all)
+        line_tbl.itemChanged.connect(_snr_refresh)
+        snr_op.currentIndexChanged.connect(_snr_refresh)
+        for _sp in snr_spins:
+            _sp.valueChanged.connect(_snr_refresh)
+        rb_any.toggled.connect(_snr_refresh)
+        _snr_refresh()
 
         # ── Button row: ? | Visualize | Accept | Unmask | Cancel ──────────
         btn_row = QHBoxLayout()
@@ -9450,30 +10441,81 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         unmask_btn.setToolTip('Remove any active mask')
         for b in (visualize_btn, accept_btn, unmask_btn, cancel_btn):
             btn_row.addWidget(b)
-        layout.addLayout(btn_row)
+        outer.addLayout(btn_row)
+
+        def _snr_fields():
+            """(keep_field, mask_array, combined_map) for the S/N tab, or Nones."""
+            keep, combined, why = _snr_keep_mask()
+            if keep is None:
+                QMessageBox.information(self, 'Mask Spaxels', why)
+                return None, None, None
+            live = hcss._live(FITS_DATA)
+            keep_field = np.where(live, keep.astype(float), np.nan)
+            return keep_field, (live & ~keep), combined
+
+        def _active_fields():
+            """Whichever tab is in front decides what Visualize/Accept act on."""
+            if tabs.currentWidget() is snr_tab:
+                return _snr_fields()
+            cur = _current(announce=True)
+            if cur is None:
+                return None, None, None
+            m, op = cur
+            kf, ma = self._mask_keep_field(m, op, spin.value())
+            return kf, ma, None
 
         def _on_visualize():
-            cur = _current()
-            if cur is None:
+            keep_field, _ma, _c = _active_fields()
+            if keep_field is None:
                 return
-            m, op = cur
-            keep_field, _mask = self._mask_keep_field(m, op, spin.value())
-            vw.show_mask_preview(keep_field)
+            # Same visual language as the self-sky panel: red hatch over what is
+            # masked OUT, cyan outline on the boundary. An outline alone leaves
+            # "which side is kept?" ambiguous on a disconnected mask.
+            vw.show_sky_region_preview(keep_field)
 
         def _on_accept():
-            cur = _current()
-            if cur is None:
+            global snr_map, snr_value
+            _kf, mask_array, combined = _active_fields()
+            if mask_array is None:
                 return
-            m, op = cur
-            _keep_field, mask_array = self._mask_keep_field(m, op, spin.value())
+            if combined is not None:
+                # Keep the legacy S/N globals in step so templates, the batch
+                # manifest's snr_threshold and the N-sigma contour keep working
+                # now that this tab owns the S/N gate. The template form is
+                # "any line, >", so a stricter criterion (all / a different
+                # operator) records a permissive 0 there and leaves the display
+                # mask — which also gates the fit — to carry the real rule.
+                snr_map = combined
+                # A template carries ONE threshold applied as "any line, >", so
+                # the export is exact only when every ticked line shares the
+                # same cut. Otherwise record a permissive 0 and let the display
+                # mask (which also gates the fit) carry the real per-line rule.
+                _thrs = {t for _l, _c, t in _snr_checked()}
+                portable = (rb_any.isChecked() and
+                            OPS[snr_op.currentIndex()][1] == '>' and
+                            len(_thrs) == 1)
+                snr_value = float(next(iter(_thrs))) if portable else 0.0
+                invalidate_snr_cache('S/N mask applied')
+                try:
+                    vw.set_snr_contour_visible(True)
+                except Exception:
+                    pass
             vw.clear_mask_preview()
             vw._spaxel_mask = mask_array
             vw.redraw_current_image()
             dlg.accept()
 
         def _on_unmask():
+            global snr_value
             vw.clear_mask_preview()
             vw._spaxel_mask = None
+            # Drop the S/N gate too. Leaving snr_value set would keep the fit
+            # silently gated by a threshold with nothing on screen to show it.
+            snr_value = 0.0
+            try:
+                vw.set_snr_contour_visible(False)
+            except Exception:
+                pass
             vw.redraw_current_image()
             dlg.accept()
 
@@ -9488,7 +10530,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         cancel_btn.clicked.connect(_on_cancel)
         dlg.rejected.connect(vw.clear_mask_preview)  # safety: X / Esc
 
-        dlg.exec_()
+        # show(), not exec_(): a modal dialog would block the very interaction
+        # this feature is for. The reference must be held or Python garbage-
+        # collects the dialog the moment this method returns.
+        self._mask_dlg = dlg
+        dlg.show()
+        dlg.raise_()
 
     def _params_from_fit_row(self, base_params, rows):
         """Seed a copy of base_params from a neighbour spaxel's fitted values.
@@ -10217,12 +11264,17 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 # Insert an empty row to separate the sections
                 writer.writerow([])
                 
+                # Self-sky provenance rides in the units block so a corrected
+                # cube's fit can never be mistaken for an uncorrected one.
+                _ss = selfsky_provenance()
                 writer.writerow(['wavelength scale factor', 'flux scale factor',
-                                 'flux unit', 'wavelength unit', 'velocity unit'])
+                                 'flux unit', 'wavelength unit', 'velocity unit']
+                                + list(_ss.keys()))
 
                 writer.writerow([self.viewer_window.WLscalefactor,
                                  self.viewer_window.fluxscalefactor,
-                                 flux_unit_str(), 'Angstrom', 'km/s'])
+                                 flux_unit_str(), 'Angstrom', 'km/s']
+                                + list(_ss.values()))
     
                 # Insert an empty row to separate the sections
                 writer.writerow([])
@@ -11903,8 +12955,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                                 'Add a stellar template to a spaxel first.')
             return
         nx, ny = FITS_DATA.shape[2], FITS_DATA.shape[1]
-        smap = globals().get('snr_map', None)
-        nspax = int(np.sum(smap >= snr_value)) if smap is not None else nx * ny
+        _gate = self.fit_gate()
+        nspax = int(np.sum(_gate)) if _gate is not None else nx * ny
         total = nspax * len(preps)
         self._begin_progress(total, 'Stellar fit')
 
@@ -11913,7 +12965,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             for j in range(ny):
                 if self._fit_cancelled:
                     break
-                if smap is not None and smap[j, i] < snr_value:
+                if not self._gate_allows(_gate, i, j):
                     continue
                 for prep in preps:
                     row = self._stellar_fit_one(i, j, prep)
@@ -12263,8 +13315,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                               (df_fit['spaxel_y'] == xy[1])]
 
             self._fit_cancelled = False
+            _gate = self.fit_gate()
             todo = [(int(i), int(j)) for i, j in bad_spaxels.itertuples(index=False)
-                    if snr_map[j, i] >= snr_value]
+                    if self._gate_allows(_gate, int(i), int(j))]
             n_skipped = len(bad_spaxels) - len(todo)
             total_fits = 0
             _t0 = time.perf_counter()
@@ -12455,8 +13508,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             self._fit_cancelled = False
             _has_stellar = ('cont_type' in df_cont.columns and
                             bool((df_cont['cont_type'] == 'stellar').any()))
+            _gate = self.fit_gate()
             gated = [(i, j) for i in range(nx) for j in range(ny)
-                     if snr_map[j, i] >= snr_value]
+                     if self._gate_allows(_gate, i, j)]
             total = max(len(gated), 1)
             progress_bar.setRange(0, total)
             progress_bar.setValue(0)
@@ -12921,7 +13975,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         n_lines = len(df_region)
         last_row_idx = n_lines - 1  # 0-based index of the new line in df_region
 
-        button_columns = ['Line_Name', 'SNR', 'Rest Wavelength',
+        button_columns = ['Line_Name', 'Rest Wavelength',
                           'Amp_0', 'Amp_0_lowlim', 'Amp_0_highlim',
                           'Centroid_0', 'Centroid_0_lowlim', 'Centroid_0_highlim',
                           'Sigma_0', 'Sigma_0_lowlim', 'Sigma_0_highlim',
@@ -13011,11 +14065,20 @@ class FitParamsWindow(QtWidgets.QMainWindow):
 
         # ── Helpers ───────────────────────────────────────────────────────────
         def _apply_result(ned_name, ned_z):
-            """Write NED name and redshift into HyperCube state."""
-            name_edit.setText(ned_name)
-            df_obs.loc[0, 'sourcename'] = ned_name
+            """Write the NED redshift into HyperCube state, keeping the user's name.
+
+            NED is consulted for the MEASUREMENT, never to relabel the target.
+            The canonical identifier NED returns for "F01364-1042" may be
+            "2MASX J01385289-1027113"; substituting it silently breaks every
+            join the user has against their own catalogues, file names and
+            manifests. NED's name is adopted only when the user gave none.
+            """
+            user_name = name_edit.text().strip()
+            label = user_name or ned_name
+            name_edit.setText(label)
+            df_obs.loc[0, 'sourcename'] = label
             df_obs.loc[0, 'redshift']   = ned_z
-            self.source_name_button.setText(f'Source: {ned_name}')
+            self.source_name_button.setText(f'Source: {label}')
             self.source_redshift_button.setText(f'z: {ned_z}')
 
         def _query_ned_by_name():
@@ -13052,10 +14115,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     ned_z    = float(z_str) if z_str else None
 
                 if ned_z is None:
-                    status.setText(f'Found: {ned_name} — no redshift in NED.')
-                    name_edit.setText(ned_name)
-                    df_obs.loc[0, 'sourcename'] = ned_name
-                    self.source_name_button.setText(f'Source: {ned_name}')
+                    # Keep the user's label here too; only fill it in if blank.
+                    _lbl = name_edit.text().strip() or ned_name
+                    status.setText(f'NED matched {ned_name} — no redshift there.')
+                    name_edit.setText(_lbl)
+                    df_obs.loc[0, 'sourcename'] = _lbl
+                    self.source_name_button.setText(f'Source: {_lbl}')
                 else:
                     _apply_result(ned_name, ned_z)
                     status.setText(f'✓  {ned_name}   z = {ned_z:.6f}')
@@ -13102,10 +14167,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                     ned_z    = float(z_str) if z_str else None
 
                 if ned_z is None:
-                    status.setText(f'Found: {ned_name} — no redshift in NED.')
-                    name_edit.setText(ned_name)
-                    df_obs.loc[0, 'sourcename'] = ned_name
-                    self.source_name_button.setText(f'Source: {ned_name}')
+                    # Keep the user's label here too; only fill it in if blank.
+                    _lbl = name_edit.text().strip() or ned_name
+                    status.setText(f'NED matched {ned_name} — no redshift there.')
+                    name_edit.setText(_lbl)
+                    df_obs.loc[0, 'sourcename'] = _lbl
+                    self.source_name_button.setText(f'Source: {_lbl}')
                 else:
                     _apply_result(ned_name, ned_z)
                     status.setText(f'Found: {ned_name}   z = {ned_z:.6f}')
