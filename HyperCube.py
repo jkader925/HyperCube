@@ -8,7 +8,7 @@ Created on Fri Mar 28 15:01:22 2025
 
 # Real module attribute (it used to sit inside the docstring, where nothing could
 # read it and it went stale). Keep in step with CHANGELOG.md and the git tag.
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 

@@ -8,6 +8,170 @@ output formats, and every such change is called out under **Output format** belo
 
 ## [Unreleased]
 
+---
+
+## [v0.5.0] — 2026-09-15
+
+Rest-frame fitting templates and headless batch mode, self-sky subtraction, and a single
+definition of which spaxels get fitted. This release also ships everything that
+accumulated after the `v0.4.0` tag: a wavelength-dependent instrument LSF, per-component
+constraints, multi-extension FITS ingest, an S/N mask that measures the line rather than
+the brightness, resolving power read from the cube, and UI scaling.
+
+### Added — self-sky subtraction
+
+`HyperCube_SelfSky.py` (Qt-free), `Cube: → Self-Sky…` in the GUI, `--selfsky` in
+`hypercube_batch`, and 26 unit tests in `test_selfsky.py`.
+
+The driver case is a KCWI cube with an under-subtracted airglow line at 6866 Å — 2.1 Å
+(≈92 km/s) redward of [N II] 6548 at *z* = 0.048232 and **2.5× brighter than the real
+line**, which the fitter picks up in essentially every spaxel.
+
+The residual is **additive**: its excess over the local sidebands is flat at ≈0.008 while
+the continuum beneath varies by 50×. A naive regression suggests `excess = 0.57·continuum
++ 0.00725`, but that slope comes entirely from the top 5% bin, which is the galaxy with
+its real [N II] 6548 on top. Multiplicative artifacts are out of scope.
+
+- **The statistic is the first line of defence, the mask the second.** Continuum-faint
+  does not mean line-free: 12.7% of a faintest-60%-by-white-light pool still has
+  Hα+[N II] at S/N > 3 (6.8% at S/N > 5). Bias at Hα as a fraction of the galaxy line
+  peak is 0.63% for a mean against 0.37% for a median, and injecting contamination up to
+  60% of the pool moves the median by 0.2%. `_STATISTICS` therefore contains **no mean**,
+  and callers pass a *name* rather than a callable so one cannot be smuggled in.
+- **Measure line contamination with per-spaxel channel-to-channel noise**, not the spatial
+  scatter of the continuum map — the latter is ≈2× too lenient and hides exactly the faint
+  outflow the mask exists to exclude.
+- **Vetoes AND, never OR, and are meant to be stacked.** A veto built on one line cannot
+  remove an outflow visible only in another. Four sources: faintest *N*% by white light,
+  white light below a value, a channel map off the live **C** window minus locked X/V
+  sidebands, and any fitted line or quality map. On the driver cube, adding an Hα+[N II]
+  channel-map veto to the faintest-60% continuum veto removed **2270 spaxels the continuum
+  veto had kept** (8035 → 5765).
+- **A veto window overlapping the artifact is refused, not warned about.** A channel map
+  at 6866 Å *is* a map of the sky residual, so vetoing on it biases the pool low and the
+  bias is invisible in the output. The guard is opt-in and armed deliberately, because
+  prefilling it from the live C window rejected the user's own *C-drag over a line → add
+  channel-map veto* workflow.
+- **Variance propagation is mandatory**, as var(median) = (π/2)·var(mean). Using the
+  mean's σ²/N understates the added noise by 57% and over-weights the corrected region in
+  a 1/σ-weighted fit.
+- **Subtract only where the spaxel has data.** Off-detector voxels are exact zeros rather
+  than NaN and the DRP `MASK` extension is often all-zero, so subtracting everywhere turns
+  those zeros into −sky and creates real negative data.
+- **An unusable pool blocks.** `SkyPoolTooSmall` rather than a noisy sky; per-column
+  blocks below the floor fall back to global and are recorded in `fallback_cols` so a
+  fallback never looks like a measurement.
+
+Measured on the driver cube (faintest-60% white-light mask, 8035 spaxels):
+
+| mode | faint-region artifact | galaxy excess | gradient span |
+|---|---|---|---|
+| before | 0.00772 | 0.01065 | 0.00251 |
+| global | **−0.00028** | 0.00265 | 0.00251 |
+| per-column | **−0.00001** | 0.00369 | **0.00028** |
+
+The real [N II] 6548 survives at ≈0.003 in both modes; per-column additionally flattens
+the ≈30% across-slice gradient by ≈9×, matching the DRP modelling sky per slice.
+
+- The session stores the **mask**, not the cube — ≈13 kB against ≈150 MB — and storing the
+  resolved boolean rather than the recipe means a fit-derived mask restores exactly
+  without needing the fit back. The pristine cube lives in `SELFSKY_ORIG_*`, so a second
+  Apply cannot double-subtract; there is a test for exactly that. A failed restore reverts
+  rather than leaving a half-corrected cube.
+- Provenance rides in the fit CSV's scale/units block in both writers and in the window
+  title, so a fit from a corrected cube is distinguishable from one that is not.
+- **The batch rebuilds the mask from a declared recipe, never a shipped array**, so a run
+  is reproducible from its arguments and a stale `.npy` applied to the wrong cube cannot
+  happen. Batch therefore supports the faintest-*N*% source only. `--selfsky-statistic` is
+  restricted by argparse `choices` to the same no-mean list. GUI and batch produce
+  **bit-identical** cubes and sky spectra in both modes.
+
+> This is a workaround, not a fix. For KCWI/KCRM the root cause is upstream: `SubtractSky`
+> scales the sky master by exposure time only and never fits the airglow amplitude. This
+> module is for cubes that will not be re-reduced, and must not become the reason the
+> reduction is never fixed.
+
+### Changed — Mask Spaxels is tabbed, with a threshold per line
+
+**Tab 1, *Map criterion*** — map, operator, value, plus a **`C-region (channel map)`**
+source built from the live C window minus locked X/V sidebands, through the same Qt-free
+`channel_map` the self-sky vetoes use, so the two cannot drift. It needs no fit, so the
+dialog no longer refuses to open when nothing has been fitted — the old early return would
+have hidden the one source that does not require a fit. The map is rebuilt on every access
+rather than cached: the dialog is modeless and the user is expected to move the C window
+while it is open.
+
+**Tab 2, *S/N*** — every line in the model, **each with its own threshold**, one operator,
+and an **any / all** combiner.
+
+- One universal cut is wrong whenever lines differ in brightness, which is the normal
+  case: [O III] 4959 is a third of 5007 by atomic physics, so a cut that keeps 4959 is far
+  too lax for 5007. Measured on a graded synthetic pair, `all` at 15/5 keeps 146 spaxels
+  against 31 for a universal 15/15 — **115 spaxels differ**, all of them strong in 5007
+  where the 3× fainter 4959 simply cannot reach 15.
+- **`any` + `>` with one shared threshold reproduces the old SNR buttons exactly** —
+  verified spaxel-for-spaxel on a synthetic two-line cube: the old gate
+  (`nanmax(per-line) ≥ thr`) and the new `any line, > thr` select the identical 54
+  spaxels, 0 disagreements. `all` is a strict subset (6 spaxels) — the new capability, for
+  when a line *ratio* must be measurable in the same spaxel.
+- S/N is deliberately **not** offered in tab 1. Two routes to the same cut, one of which
+  cannot express per-line thresholds, is how the old per-line SNR buttons became
+  confusing.
+- `compute_snr_map(..., per_line=True)` returns the per-line maps it already builds
+  internally instead of their `nanmax` — a flag rather than a second function, so the
+  combined and per-line maps can never disagree. Verified `max(per_line) == combined`.
+- The dialog is modeless and floats above the app, so channel selection and reading fluxes
+  off the map stay live while it is open.
+
+### Changed — one definition of which spaxels get fitted
+
+`FitParamsWindow.fit_gate()` returns an `(ny, nx)` boolean ANDing the S/N gate
+(`snr_map >= snr_value`) with **everything hidden by Mask Spaxels**. All four call sites go
+through it — the main cube fit, the Rectify re-fit, the stellar fit, and the Rectify count
+preview, which must agree with the loop it predicts. No raw `snr_map[j, i] >= snr_value`
+comparisons remain.
+
+> ⚠️ **This changes documented behaviour.** The Mask help text used to read "It is a
+> display mask — it does not change the fit"; masked spaxels are now excluded from cube
+> fits.
+
+Accept keeps the legacy S/N globals in step, so templates' `snr_threshold`, the batch
+manifest column and the N-σ contour keep working now that this tab owns the gate. A
+template can only express "any line, >", so a stricter criterion writes a permissive
+`snr_value = 0` and leaves the display mask to carry the real rule. Unmask clears the S/N
+gate too — leaving it set would keep the fit silently gated with nothing on screen to say
+so.
+
+- **Removed:** the `SNR` button column in the Spectral Region tabs. The `df['SNR']`
+  dataframe column is deliberately **kept** — it is written by the CSV/session/template
+  round-trip in four places, so removing it is a file-format change, not a UI change.
+- The S/N column in the Spectral Region tab was *not* redundant with the new per-line mask
+  and was only removed once the gate moved: it set the pre-fit threshold, computed and
+  cached `snr_map`, drew the N-σ contour, and is persisted in templates.
+
+### Changed — NED supplies measurements, never the label
+
+**The user's supplied name is authoritative and is never overwritten by a resolver.**
+Every NED path previously wrote NED's canonical identifier back into the name field,
+`df_obs['sourcename']` and the Source button — so typing `F01364-1042` could relabel the
+target `2MASX J01385289-1027113`, silently breaking every join the user has against their
+own catalogues, file names, target directories and manifests.
+
+All five paths (two dialogs × {by name, by coords} plus the Qt-free `resolve_redshift`)
+now use `label = user_supplied_name or ned_name`. A non-empty user name always wins; NED's
+name is adopted only when the user gave none, which is the resolve-by-coordinates case
+where there is no user name to protect. What *is* taken from the resolver is the redshift
+and coordinates; what is *shown* is `z = 0.048232  (NED matched: <ned name>)`, so the
+resolution can be confirmed without the identity being swapped.
+`HyperCube_Templates.resolve_redshift` now returns `(name_as_supplied, ned_name, z)` for
+the same reason — a manifest draft records what matched as evidence, beside the name the
+user chose.
+
+This matters beyond cosmetics: MUSE cubes carry `OBJECT = 2MASX J07273754-0254540` rather
+than the IRAS ID, which is exactly why a manifest exists. A resolver that rewrites names
+recreates the problem the manifest was built to solve.
+
+
 ### FIXED — applying a template raised the sigma floor to the instrumental width
 
 **Yes, sigma bounds are converted per cube** — every bound goes through the LSF
@@ -510,8 +674,8 @@ much weaker than it looked, and two of its behaviours were wrong.
   `restart:swapped`, `incumbent`, `base`) and `rectify_score`, written into the same row
   dict the fit kernel returns so they reach CSV/FITS with no new plumbing. A rectified
   spaxel was previously indistinguishable from an ordinary fit, which made the pass
-  impossible to audit — and `CiK_Spec.md` designates Rectify as the baseline against which
-  CiK's learned patch mode will be validated.
+  impossible to audit — and the Context-is-Key design designates Rectify as the baseline
+  against which its learned patch mode will be validated.
 - The goodness rule lives in a new Qt-free module, **`HyperCube_Quality.py`**, mirroring
   `HyperCube_Noise.py`, so the GUI, the batch kernel and (later) CiK share one definition
   of "good fit".

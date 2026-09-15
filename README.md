@@ -11,15 +11,19 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 ---
 
-## What's New in v0.4.0
+## What's New in v0.5.0
 
-- **Measurement errors are propagated into every uncertainty.** HyperCube now finds your cube's per-pixel flux errors automatically (a `ERR`/`VAR`/`IVAR`/`STAT` extension, or a sidecar file such as the KCWI DRP's `*_vcubes.fits`), converts them to 1σ, and **weights the fit by 1/σ**. The reported `*_std` values are therefore propagated measurement errors rather than residual-scatter estimates. See [Measurement errors & parameter uncertainties](#measurement-errors--parameter-uncertainties).
-- **A robust empirical fallback.** With no error cube — or an unusable one — the noise is measured per spaxel from the **line-free continuum inside each fit window** (DER_SNR). Whichever source is used is recorded per spaxel in the output as `noise_source`, so a fit table always states how its uncertainties were derived.
-- **New `Measurement Errors…` dialog** to override the automatic choice: pick any extension of any FITS file, declare whether it holds 1σ / variance / inverse variance, or force the empirical estimate.
-- **`vel_std`.** Velocity uncertainties are now written directly (σ_v = c·σ_λ/λ₀), along with `rchisq_w` — a reduced χ² over the fitted pixels that actually sits near 1 for a good fit.
-- **Units are explicit everywhere.** CSV column names carry their unit (`cen_fit_A`, `vel_std_kms`, `amp_fit_flux`, …), the cube's flux unit is written into the CSV header, FITS maps carry `BUNIT`, and **σ is a velocity dispersion in km/s** in every output. New `*_STD_` uncertainty maps are written to the FITS output. Older CSV/FITS products still load.
-- **Parallel cube fitting**, **Rectify Bad Fits**, **sequential core→outflow fitting**, **calibrated quality metrics**, **velocity and integrated-flux constraints**, **Smart Constraints**, and **multiple stellar regions** — all previously unreleased — ship in this version.
-- **Packaging fixes.** The stellar template libraries (`eMILES/`, `indo_us_library/`) and two required modules are now included in the repository, so a fresh clone runs — including stellar fitting — with no extra downloads.
+- **Rest-frame fitting templates.** A template (`*.hct.csv`) states a model the way physics does — rest wavelengths, velocity offsets from systemic, *intrinsic* velocity dispersions, bounds, K-groups, constraints — so **one file applies to every galaxy observed with a given instrument**. Nothing galaxy-specific lives in it: redshift and cube path come from a **manifest**, and the instrument's resolution from the cube itself. **Save Template / Load Template** are on the *Output:* toolbar row. See [Initiating Models with Configuration Files](#initiating-models-with-configuration-files).
+- **Headless batch mode.** `python -m hypercube_batch` expands a template across a manifest and fits every target unattended, writing products the GUI reopens plus a `run_log.csv` recording the template, its version and the git SHA. `--dry-run` reports which lines are observable per galaxy before you spend time fitting. See [Pipeline Usage Mode](#pipeline-usage-mode).
+- **A wavelength-dependent instrument LSF.** Intrinsic σ is broadened at **each line's own observed wavelength**, which is what makes one template portable — MUSE's resolving power varies 59% across a single model, so a flat `R` understates instrumental σ by 25 km/s at Hβ and 0.3 km/s at [S II]: a *differential* error across the very lines you are comparing.
+- **Self-sky subtraction** for cubes with an under-subtracted airglow residual — the driver case is a sky line 2.1 Å from [N II] 6548 and 2.5× brighter than the real line. A sky spectrum is built by combining object-free spaxels (**median, never mean**) and subtracted, with its variance propagated into σ. Masks stack, a veto drawn on the artifact's own window is refused, and Revert restores the cube bit-identically. In the GUI as `Cube: → Self-Sky…`, headless as `--selfsky`. See [Self-sky subtraction](#self-sky-subtraction).
+- **Spaxel masking is tabbed, and now gates the fit.** A map criterion (including a channel map off the live **C** window, which needs no fit) and a per-line S/N tab where **each line carries its own threshold** with an any/all combiner — one universal cut is wrong whenever lines differ in brightness, since [O III] 4959 is a third of 5007 by atomic physics. ⚠️ **Behaviour change:** masked spaxels are now **excluded from cube fits**; masking used to be display-only. See [Masking spaxels & the fit gate](#masking-spaxels--the-fit-gate).
+- **The S/N mask measures the line, not the brightness.** Continuum is subtracted before the ratio, so a bright continuum source no longer passes at any threshold with no emission at all (a foreground star scored S/N = 43 on a spectrum containing no Hα). ⚠️ The numbers are smaller than before, so **a threshold carried over from v0.4 is a stricter cut** — re-check it against the contour. The map is also computed once and cached.
+- **Resolving power is read from the cube** at ingest, with a tooltip saying where the value came from, so a derived number is never mistaken for one you typed. KCWI/KCRM, MIRI MRS, NIRSpec and MUSE are recognised; a coadded supercube deliberately gets no value.
+- **Per-component constraints, multi-extension FITS ingest, and UI scaling.** Smart Constraints gains a per-component-tier bound table and blue/red side constraints for broad wings; an extension picker handles multi-extension FITS; and the interface scales to the display and platform font.
+- **Names are yours.** NED is asked for the **measurement**, never for a relabelling — resolving `F01364-1042` can no longer rename your target `2MASX J01385289-1027113` and break every join you have against your own catalogues.
+
+Templates, sessions and fit products from v0.4 still load.
 
 The full history is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -40,6 +44,10 @@ The full history is in [CHANGELOG.md](CHANGELOG.md).
    - [Relational constraints & kinematic groups](#relational-constraints--kinematic-groups)
    - [Sequential core→outflow fitting](#sequential-coreoutflow-fitting)
    - [Measurement errors & parameter uncertainties](#measurement-errors--parameter-uncertainties)
+   - [The S/N mask](#the-sn-mask)
+   - [Masking spaxels & the fit gate](#masking-spaxels--the-fit-gate)
+   - [Self-sky subtraction](#self-sky-subtraction)
+   - [Resolving power](#resolving-power)
    - [Calibrated fit-quality metrics & the Quality Map](#calibrated-fit-quality-metrics--the-quality-map)
    - [Rectify Bad Fits](#rectify-bad-fits)
 5. [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf)
@@ -327,6 +335,34 @@ taking the best line for each spaxel. The continuum subtraction is what makes th
 The flanks are not assumed to be line-free, because they frequently are not — at z ≈ 0.04 both [N II] lines fall inside Hα's default flanks. The continuum level is therefore taken after two asymmetric clipping passes that drop channels more than 3σ *above* the running median, removing line cores while leaving the noise distribution and any absorption intact. Without that clipping the flank median is biased upward by exactly the lines being measured, and that bias is then subtracted straight off the line.
 
 Because the numbers this produces are smaller than the un-subtracted ones it replaced, a threshold carried over from an older version of HyperCube is a **stricter** cut than it used to be; re-check it against the mask contour. Maps cached or stored in a session under the old definition are discarded rather than reused.
+
+### Masking spaxels & the fit gate
+
+**Mask Spaxels** (the `Cube:` row) is two tabs over one shared Visualize / Accept / Unmask.
+
+*Map criterion* keeps spaxels where a chosen map passes a test — any fitted parameter or quality map, or a **channel map built from the live C window** minus any locked X/V sidebands. The channel map needs no fit, so the dialog opens on a cube you have not fitted yet, and it is rebuilt on every access: the dialog is modeless, you are expected to move the C window while it is open, and a cached map would mask on a stale selection.
+
+*S/N* offers every line in the model with **its own threshold per line**, one operator, and an **any / all** combiner. One universal cut is wrong whenever lines differ in brightness — [O III] 4959 is a third of 5007 by atomic physics, so a cut that keeps 4959 is far too lax for 5007. On a graded synthetic pair, `all` at 15/5 keeps 146 spaxels against 31 for a universal 15/15. Use `any` when one detected line is enough; use `all` when a line *ratio* has to be measurable in the same spaxel.
+
+> ⚠️ **This changed in v0.5.0.** Masking used to be display-only. There is now a single definition of which spaxels are fitted — the S/N gate **AND** everything hidden by Mask Spaxels — and the main cube fit, the Rectify re-fit, the stellar fit and Rectify's count preview all use it. **Masked spaxels are no longer fitted.** *Unmask* clears the S/N gate too, so the fit is never left silently gated with nothing on screen to say so.
+
+### Self-sky subtraction
+
+Some reduced cubes keep an under-subtracted airglow line. The case this was built for sits at 6866 Å — 2.1 Å (≈92 km/s) from [N II] 6548 at *z* = 0.048232 and **2.5× brighter than the real line** — and the fitter picks it up in essentially every spaxel. `Cube: → Self-Sky…` builds a sky spectrum from the cube's own object-free spaxels and subtracts it.
+
+The residual is **additive**: its excess over the local sidebands is flat at ≈0.008 while the continuum beneath it varies by 50×. Multiplicative artifacts are out of scope.
+
+- **Object-free is defined by stacked vetoes, ANDed.** Faintest *N*% by white light, white light below a value, a channel map, or any fitted line or quality map — as many as you like, because a veto built on one line cannot remove an outflow visible only in another. The right criterion is "faint in the continuum *and* faint in every line I care about"; on the driver cube adding an Hα+[N II] veto removed 2270 spaxels the continuum veto had kept.
+- **The combining statistic is a median, never a mean.** Continuum-faint does not mean line-free: 12.7% of a faintest-60% pool still has Hα+[N II] at S/N > 3. The mean carries that through (0.63% bias at Hα against the median's 0.37%), so no mean is offered.
+- **A veto may not be drawn on the artifact's own window.** A channel map at 6866 Å *is* a map of the sky residual, so vetoing on it biases the pool low — invisibly. Point the guard at the artifact with **← set from C window** and an overlapping veto is refused, not warned about.
+- **Sky variance propagates into σ**, as var(median) = (π/2)·var(mean). The fit is 1/σ-weighted, so omitting it over-weights the corrected region.
+- Subtraction happens only where a spaxel has data — off-detector voxels are exact zeros, not NaN — and an unusably small pool refuses to produce a sky rather than producing a noisy one.
+
+Per-column mode fits the residual's ≈30% across-slice gradient, which matches the DRP modelling sky per slice. On the driver cube the faint-region artifact goes from 0.00772 to **−0.00001** and the gradient flattens ≈9×, while the real [N II] 6548 survives. Provenance rides in the fit CSV's header and the window title, so a fit from a corrected cube is distinguishable from one that is not; **Revert** restores the cube bit-identically.
+
+Headless, `--selfsky 60` does the same with the faintest-*N*% recipe. The batch rebuilds the mask from its arguments rather than loading a saved array, so a run stays reproducible and a stale mask cannot be applied to the wrong cube.
+
+> This is a workaround, not a fix. For KCWI/KCRM the root cause is upstream — `SubtractSky` scales the sky master by exposure time and never fits the airglow amplitude. Use it for cubes that will not be re-reduced.
 
 ### Resolving power
 
