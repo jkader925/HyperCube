@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use HyperCube, please cite this software release."
+type: software
+title: "HyperCube"
+authors:
+  - family-names: "Kader"
+    given-names: "Justin A."
+version: "0.5.1"
+date-released: 2026-10-08
+license: MIT
+repository-code: "https://github.com/jkader925/HyperCube"
+url: "https://github.com/jkader925/HyperCube"
+abstract: >-
+  HyperCube is an interactive and batch spectral fitting tool for integral-field
+  spectroscopic and hyperspectral data, designed to support intuitive analysis
+  while preserving automation and repeatability.
+keywords:
+  - integral field spectroscopy
+  - emission-line fitting
+  - IFU
+  - astronomy

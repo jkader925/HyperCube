@@ -402,3 +402,114 @@ def test_two_vetoes_and_correctly_and_the_count_is_exact():
     r = ss.build_sky(cube, both, mask_sources=("faintest 60%", "line channel map"))
     assert r.n_mask == int(both.sum())
     assert "AND" in r.describe()
+
+
+# ---------------------------------------------------------------- write / restore FITS
+
+def _mef(tmp_path, name='cube.fits', sidecar=False, seed=1):
+    """DATA (+ STAT variance, in-file or as a KCWI-style sidecar) with a sky line."""
+    from astropy.io import fits
+    cube, sky_amp, sky_prof, blob = make_cube(nw=60, ny=12, nx=15, seed=seed, noise=1e-3)
+    cube = cube.astype(np.float32)
+    cube[:, 0, 0] = 0.0                                    # an off-detector spaxel
+    var = np.full(cube.shape, 1e-6, dtype=np.float32)
+    path = tmp_path / name
+    hdus = [fits.PrimaryHDU(), fits.ImageHDU(cube, name='DATA')]
+    if not sidecar:
+        hdus.append(fits.ImageHDU(var, name='STAT'))
+        err = dict(path=str(path), ext=2, kind='variance')
+    else:
+        side = tmp_path / name.replace('.fits', '_vcubes.fits')
+        fits.PrimaryHDU(var).writeto(side)
+        err = dict(path=str(side), ext=0, kind='variance')
+    fits.HDUList(hdus).writeto(path)
+    return path, err, var
+
+
+def _apply_in_memory(path, err, scale=1.0, memmap_pristine=False):
+    from astropy.io import fits
+    hdul = fits.open(path, memmap=memmap_pristine)
+    pristine = (hdul[1].data if memmap_pristine else np.array(hdul[1].data)) * scale
+    sigma = np.sqrt(fits.getdata(err['path'], err['ext']).astype(float)) * scale
+    live = ss._live(pristine)
+    mask = ss.faintest_fraction_mask(ss.white_light(pristine), 0.6, live=live)
+    res = ss.build_sky(pristine, mask, statistic='median', mode='global')
+    corrected = ss.apply_sky(pristine, res)
+    sig_corr = ss.propagate_sky_variance(sigma, res, pristine.shape)
+    return hdul, pristine, corrected, sigma, sig_corr, res
+
+
+@pytest.mark.parametrize('sidecar', [False, True])
+def test_write_then_restore_is_exact(tmp_path, sidecar):
+    from astropy.io import fits
+    path, err, var = _mef(tmp_path, sidecar=sidecar)
+    orig_data = np.array(fits.getdata(path, 1))
+    orig_var = np.array(fits.getdata(err['path'], err['ext']))
+    hdul, pristine, corrected, sigma, sig_corr, res = _apply_in_memory(path, err)
+    summary = ss.write_sky_to_fits(
+        str(path), 1, corrected, pristine, 1.0,
+        error=dict(err, corrected=sig_corr, pristine=sigma), result=res,
+        provenance={'selfsky_statistic': 'median', 'selfsky_mode': 'global', 'selfsky_n_mask': res.n_mask})
+    hdul.close()
+    written = fits.getdata(path, 1)
+    np.testing.assert_allclose(written, corrected.astype(np.float32), rtol=0, atol=0)
+    assert np.all(written[:, 0, 0] == 0.0)                  # off-detector untouched
+    assert fits.getheader(path, 1)[ss.SKY_FLAG] is True
+    new_var = fits.getdata(err['path'], err['ext'])
+    np.testing.assert_allclose(new_var[:, 5, 5], (sig_corr[:, 5, 5] ** 2).astype(np.float32), rtol=1e-6)
+    assert summary['sci_voxels_changed'] > 0 and summary['err_voxels_changed'] > 0
+    backup = ss.sky_backup_path(str(path))
+    assert np.array_equal(fits.getdata(backup, 'ORIG_SCI'), orig_data)
+    assert np.array_equal(fits.getdata(backup, 'ORIG_ERR'), orig_var)
+    assert ss.file_sky_state(str(path), 1)['HCSKYSTA'] == 'median'
+
+    with pytest.raises(ss.SkyFileError):                    # no double subtraction
+        ss.write_sky_to_fits(str(path), 1, corrected, pristine)
+
+    out = ss.restore_sky_from_backup(str(path))
+    assert out['verified'] and out['backup_deleted']
+    assert np.array_equal(fits.getdata(path, 1), orig_data)            # bit-identical
+    assert np.array_equal(fits.getdata(err['path'], err['ext']), orig_var)
+    assert ss.SKY_FLAG not in fits.getheader(path, 1)
+    assert ss.file_sky_state(str(path), 1) is None
+    import os
+    assert not os.path.exists(backup)
+
+
+def test_flux_scale_is_undone_on_write(tmp_path):
+    from astropy.io import fits
+    path, err, _ = _mef(tmp_path)
+    orig = np.array(fits.getdata(path, 1))
+    hdul, pristine, corrected, sigma, sig_corr, res = _apply_in_memory(path, err, scale=1e3)
+    ss.write_sky_to_fits(str(path), 1, corrected, pristine, 1e3,
+                         error=dict(err, corrected=sig_corr, pristine=sigma), result=res)
+    hdul.close()
+    written = fits.getdata(path, 1).astype(float)
+    np.testing.assert_allclose(written[:, 5, 5], corrected[:, 5, 5] / 1e3, rtol=1e-5)
+    # the sky was subtracted in file units, not 1000x it
+    assert np.nanmax(np.abs(written - orig)) < 0.05
+
+
+def test_backup_is_read_from_disk_even_if_pristine_is_a_memmap(tmp_path):
+    """The session's pristine cube can be a memory map of the very file being
+    rewritten; the backup must still hold the original values."""
+    from astropy.io import fits
+    path, err, _ = _mef(tmp_path)
+    orig = np.array(fits.getdata(path, 1))
+    hdul, pristine, corrected, sigma, sig_corr, res = _apply_in_memory(path, err, memmap_pristine=True)
+    ss.write_sky_to_fits(str(path), 1, corrected, np.array(pristine), 1.0, result=res)
+    hdul.close()
+    assert np.array_equal(fits.getdata(ss.sky_backup_path(str(path)), 'ORIG_SCI'), orig)
+
+
+def test_restore_refuses_a_backup_from_another_file(tmp_path):
+    from astropy.io import fits
+    path, err, _ = _mef(tmp_path, name='a.fits')
+    other, _e, _v = _mef(tmp_path, name='b.fits')
+    hdul, pristine, corrected, sigma, sig_corr, res = _apply_in_memory(path, err)
+    ss.write_sky_to_fits(str(path), 1, corrected, pristine, 1.0, result=res)
+    hdul.close()
+    import shutil
+    shutil.copy(ss.sky_backup_path(str(path)), ss.sky_backup_path(str(other)))
+    with pytest.raises(ss.SkyFileError):
+        ss.restore_sky_from_backup(str(other))

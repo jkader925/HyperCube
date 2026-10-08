@@ -440,3 +440,224 @@ def propagate_sky_variance(sigma_cube: np.ndarray | None,
                   mode=result.mode, statistic=result.statistic,
                   col_edges=result.col_edges).sky_cube_view(tgt), sig.shape)
     return np.sqrt(np.square(sig) + var_full)
+
+
+# ---------------------------------------------------------------------------
+# Writing a correction into the FITS file, and undoing it
+# ---------------------------------------------------------------------------
+
+SKY_FLAG = "HCSKYSUB"          # science header: True while the file holds a self-sky subtraction
+SKY_BACKUP_KEY = "HCSKYBAK"    # science header: backup file name
+SKY_KEYS = (SKY_FLAG, SKY_BACKUP_KEY, "HCSKYSTA", "HCSKYMOD", "HCSKYNM", "HCSKYDAT")
+ERR_FLAG = "HCSKYVAR"          # error header: sky variance folded in
+
+
+class SkyFileError(RuntimeError):
+    """Refusal to write or restore; the message says why and what to do."""
+
+
+def sky_backup_path(cube_path: str) -> str:
+    import os
+    return os.path.splitext(cube_path)[0] + "_preSelfSky.fits"
+
+
+def file_sky_state(cube_path: str, sci_ext: int) -> dict | None:
+    """The self-sky record in a cube's science header, or None if the file is uncorrected."""
+    from astropy.io import fits
+    header = fits.getheader(cube_path, sci_ext)
+    if not header.get(SKY_FLAG, False):
+        return None
+    return {k: header.get(k) for k in SKY_KEYS if k in header}
+
+
+def _sigma_to_kind(sigma: np.ndarray, kind: str) -> np.ndarray:
+    """Inverse of HyperCube_Noise.to_sigma for writing an error extension back."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        if kind == "variance":
+            return np.square(sigma)
+        if kind == "ivar":
+            return np.where(sigma > 0, 1.0 / np.square(sigma), 0.0)
+        return sigma
+
+
+def _changed(new: np.ndarray, old: np.ndarray) -> np.ndarray:
+    """Voxels whose value differs; NaN == NaN counts as unchanged."""
+    return ~((new == old) | (np.isnan(new) & np.isnan(old)))
+
+
+def write_sky_to_fits(cube_path: str, sci_ext: int,
+                      corrected: np.ndarray, pristine: np.ndarray,
+                      flux_scale: float = 1.0,
+                      error: dict | None = None,
+                      result: "SkyResult | None" = None,
+                      provenance: dict | None = None) -> dict:
+    """Write an applied self-sky correction into the cube file itself.
+
+    `corrected` / `pristine` are the in-memory cubes (after / before), on the
+    session's flux scale; `error` optionally describes the error cube to update:
+    {'path', 'ext', 'kind', 'corrected', 'pristine'} (1-sigma, same flux scale).
+
+    The original science (and error) arrays are first copied, as stored on
+    disk, into ``<cube>_preSelfSky.fits`` -- read from the FILE, not from
+    memory, because the in-memory pristine cube may be a memory map of that
+    very file. Only voxels the correction changed are then rewritten, so every
+    other voxel stays bit-identical. The science header gets HCSKYSUB = T and
+    the recipe, so the file cannot later be mistaken for an uncorrected one or
+    have the sky subtracted a second time.
+
+    Refuses (SkyFileError) if the file already carries a subtraction or a
+    backup already exists. Returns a summary dict.
+    """
+    import os
+    from datetime import datetime, timezone
+    from astropy.io import fits
+
+    backup = sky_backup_path(cube_path)
+    if file_sky_state(cube_path, sci_ext) is not None:
+        raise SkyFileError("This FITS file already has a self-sky subtraction written into it. "
+                           "Restore the original first.")
+    if os.path.exists(backup):
+        raise SkyFileError(f"A backup already exists ({os.path.basename(backup)}). "
+                           "Restore from it, or move it aside, before writing again.")
+    scale = float(flux_scale) if flux_scale else 1.0
+
+    with fits.open(cube_path, memmap=True) as hdul:
+        hdu = hdul[sci_ext]
+        for key in ("BSCALE", "BZERO"):
+            if float(hdu.header.get(key, 1.0 if key == "BSCALE" else 0.0)) != (1.0 if key == "BSCALE" else 0.0):
+                raise SkyFileError(f"The science extension uses {key}; refusing to rewrite scaled data.")
+        orig_sci = np.array(hdu.data)                   # a real copy, off the file
+    if orig_sci.shape != np.shape(corrected):
+        raise SkyFileError(f"Cube shape {np.shape(corrected)} does not match the file {orig_sci.shape}.")
+
+    orig_err = None
+    if error is not None:
+        with fits.open(error["path"], memmap=True) as hdul:
+            orig_err = np.array(hdul[int(error["ext"])].data)
+        if orig_err.shape != orig_sci.shape:
+            raise SkyFileError("The error extension's shape does not match the cube.")
+
+    # Backup first; nothing is modified until it is on disk and readable.
+    primary = fits.PrimaryHDU()
+    ph = primary.header
+    ph["ORIGFILE"] = os.path.basename(cube_path)
+    ph["SCIEXT"] = (int(sci_ext), "science extension index")
+    if error is not None:
+        ph["ERRFILE"] = os.path.basename(error["path"])
+        ph["ERRSAME"] = (os.path.abspath(error["path"]) == os.path.abspath(cube_path), "error ext in the cube file")
+        ph["ERREXT"] = (int(error["ext"]), "error extension index")
+        ph["ERRKIND"] = (str(error.get("kind", "sigma")), "variance | ivar | sigma")
+    ph["CREATED"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ph["HISTORY"] = "HyperCube self-sky backup: original arrays before the subtraction was written"
+    hdus = [primary, fits.ImageHDU(orig_sci, name="ORIG_SCI")]
+    if orig_err is not None:
+        hdus.append(fits.ImageHDU(orig_err, name="ORIG_ERR"))
+    if result is not None:
+        hdus.append(fits.ImageHDU(np.asarray(result.sky, dtype=np.float64), name="SKY"))
+        hdus.append(fits.ImageHDU(np.asarray(result.sky_var, dtype=np.float64), name="SKY_VAR"))
+    fits.HDUList(hdus).writeto(backup, overwrite=False)
+    with fits.open(backup, memmap=True) as check:
+        if check["ORIG_SCI"].data.shape != orig_sci.shape:
+            raise SkyFileError("Backup verification failed; the cube was NOT modified.")
+
+    corrected = np.asarray(corrected, dtype=np.float64)
+    pristine = np.asarray(pristine, dtype=np.float64)
+    changed = _changed(corrected, pristine)
+    new_sci = orig_sci.copy()
+    new_sci[changed] = (corrected[changed] / scale).astype(orig_sci.dtype)
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    prov = dict(provenance or {})
+    with fits.open(cube_path, mode="update", memmap=True) as hdul:
+        hdul[sci_ext].data[...] = new_sci
+        h = hdul[sci_ext].header
+        h[SKY_FLAG] = (True, "HyperCube self-sky subtracted in file")
+        h[SKY_BACKUP_KEY] = os.path.basename(backup)
+        h["HCSKYSTA"] = (str(prov.get("selfsky_statistic", getattr(result, "statistic", ""))), "sky statistic")
+        h["HCSKYMOD"] = (str(prov.get("selfsky_mode", getattr(result, "mode", ""))), "global | per-column")
+        h["HCSKYNM"] = (int(prov.get("selfsky_n_mask", getattr(result, "n_mask", 0)) or 0), "sky-pool spaxels")
+        h["HCSKYDAT"] = (stamp, "UTC written")
+        h["HISTORY"] = f"HyperCube self-sky subtracted into file; backup {os.path.basename(backup)}"
+        n_err = 0
+        if error is not None and os.path.abspath(error["path"]) == os.path.abspath(cube_path):
+            n_err = _write_error(hdul[int(error["ext"])], orig_err, error, scale)
+        hdul.flush()
+    if error is not None and os.path.abspath(error["path"]) != os.path.abspath(cube_path):
+        with fits.open(error["path"], mode="update", memmap=True) as ehdul:
+            n_err = _write_error(ehdul[int(error["ext"])], orig_err, error, scale)
+            ehdul.flush()
+    return dict(backup=backup, sci_voxels_changed=int(changed.sum()), err_voxels_changed=n_err,
+                written_utc=stamp)
+
+
+def _write_error(hdu, orig_err, error, scale):
+    sig_new = np.asarray(error["corrected"], dtype=np.float64)
+    sig_old = np.asarray(error["pristine"], dtype=np.float64)
+    changed = _changed(sig_new, sig_old)
+    out = orig_err.copy()
+    out[changed] = _sigma_to_kind(sig_new[changed] / scale, error.get("kind", "sigma")).astype(orig_err.dtype)
+    hdu.data[...] = out
+    hdu.header[ERR_FLAG] = (True, "self-sky variance added (HyperCube)")
+    hdu.header["HISTORY"] = "HyperCube self-sky: sky-estimate variance folded into this extension"
+    return int(changed.sum())
+
+
+def restore_sky_from_backup(cube_path: str, delete_backup: bool = True) -> dict:
+    """Put back the original arrays saved by write_sky_to_fits, verify, and
+    (by default) delete the backup. Returns the restored science array and a
+    summary. Refuses (SkyFileError) if the backup is missing or does not belong
+    to this file."""
+    import os
+    from astropy.io import fits
+
+    backup = sky_backup_path(cube_path)
+    if not os.path.exists(backup):
+        raise SkyFileError(f"No backup found ({os.path.basename(backup)}).")
+    with fits.open(backup, memmap=False) as bk:
+        ph = bk[0].header
+        if ph.get("ORIGFILE") != os.path.basename(cube_path):
+            raise SkyFileError(f"{os.path.basename(backup)} was made from {ph.get('ORIGFILE')}, "
+                               f"not {os.path.basename(cube_path)}.")
+        sci_ext = int(ph["SCIEXT"])
+        orig_sci = np.array(bk["ORIG_SCI"].data)
+        orig_err = np.array(bk["ORIG_ERR"].data) if "ORIG_ERR" in bk else None
+        err_file = ph.get("ERRFILE")
+        err_ext = int(ph["ERREXT"]) if "ERREXT" in ph else None
+        err_same = bool(ph.get("ERRSAME", False))
+    err_path = cube_path if err_same else (os.path.join(os.path.dirname(cube_path), err_file)
+                                           if err_file else None)
+
+    with fits.open(cube_path, mode="update", memmap=True) as hdul:
+        if hdul[sci_ext].data.shape != orig_sci.shape:
+            raise SkyFileError("The backup's shape does not match the cube; nothing restored.")
+        hdul[sci_ext].data[...] = orig_sci
+        h = hdul[sci_ext].header
+        for key in SKY_KEYS:
+            if key in h:
+                del h[key]
+        h["HISTORY"] = "HyperCube self-sky subtraction reverted from backup"
+        if orig_err is not None and err_same:
+            hdul[err_ext].data[...] = orig_err
+            if ERR_FLAG in hdul[err_ext].header:
+                del hdul[err_ext].header[ERR_FLAG]
+        hdul.flush()
+    if orig_err is not None and not err_same and err_path:
+        with fits.open(err_path, mode="update", memmap=True) as ehdul:
+            ehdul[err_ext].data[...] = orig_err
+            if ERR_FLAG in ehdul[err_ext].header:
+                del ehdul[err_ext].header[ERR_FLAG]
+            ehdul.flush()
+
+    with fits.open(cube_path, memmap=True) as hdul:
+        ok = np.array_equal(np.asarray(hdul[sci_ext].data), orig_sci, equal_nan=True)
+        if orig_err is not None and err_same:
+            ok &= np.array_equal(np.asarray(hdul[err_ext].data), orig_err, equal_nan=True)
+    if orig_err is not None and not err_same and err_path:
+        with fits.open(err_path, memmap=True) as ehdul:
+            ok &= np.array_equal(np.asarray(ehdul[err_ext].data), orig_err, equal_nan=True)
+    if not ok:
+        raise SkyFileError("Restore could not be verified; the backup was kept.")
+    if delete_backup:
+        os.remove(backup)
+    return dict(original=orig_sci, sci_ext=sci_ext, verified=True,
+                backup_deleted=bool(delete_backup), error_restored=orig_err is not None)

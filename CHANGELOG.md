@@ -10,6 +10,113 @@ output formats, and every such change is called out under **Output format** belo
 
 ---
 
+## [v0.5.1] — 2026-10-08
+
+Per-spaxel velocity seeds for cube fits, writing a self-sky correction into the cube
+file, an alignment export that leaves the cube alone, and a faster Mask Spaxels dialog.
+With V-seed off, fit tasks are exactly what they were in v0.5.0.
+
+### Added — velocity-seeded cube fits
+
+`HyperCube_VelocitySeed.py` (Qt-free), `shift_line_centroids` and a `seed_vel` argument
+to `run_pool` in `HyperCube_fit.py`, the **V-seed** checkbox in the Fit Parameters
+toolbar (both the parallel and serial Fit Cube paths), `--seed-velocity` in
+`hypercube_batch`, and 14 tests in `test_velocityseed.py`.
+
+Rotation moves lines by hundreds of km/s across the MAUNA fields, so a cube fit started
+everywhere from one set of guesses wanders off far from where the model was built. The
+seed pipeline fits the mean spectrum of the gated spaxels, then matched-filters every
+spaxel against all of those lines at once over ±vmax. Matching all lines together keeps
+it off the Hα/[N II] aliases. Trusted velocities are median-filtered 3×3 (wider boxes
+for gaps), and `shift_line_centroids` moves each spaxel's free centroids together with
+their finite bounds. Only centroids move: amplitudes, widths and component count stay
+the model's, and tied (`expr`) or frozen centroids are left alone.
+
+- **The shift is measured against the MODEL's centroids, not the mean-spectrum fit's.**
+  The mean spectrum of a rotating field is double-horned, so the fit's own centroids sit
+  tens of km/s off where lines blend (60 km/s in the synthetic test). Every seed
+  inherited that offset until this was fixed.
+- **S/N cannot reject aliases; the explained fraction does.** A shift beyond ±vmax peaks
+  *inside* the grid (Hα on [N II] 6548 at v−675) at high S/N. The explained fraction
+  `frac = snr²/(Σwr² − n)` separates them: synthetic aliases ≤ 0.22, matches 0.66–1.0.
+- **`fmin` defaults to 0.25, not 0.5.** On real MUSE cubes the single-Gaussian template
+  leaves most bright spaxels at frac 0.2–0.5, and every one of them agrees with its
+  bright neighbours to < 75 km/s. A cut at 0.5 rejected ~85% of F09111-1007's good
+  measurements.
+
+Measured on `SingleFits_NoConstraints`, with the same code and weights in both runs:
+
+| | F14348-1447 unseeded → seeded | F09111-1007 unseeded → seeded |
+|---|---|---|
+| Hα vs [N II] 6583 \|Δv\| > 200 | 15.4% → 1.6% | 18.5% → 2.1% |
+| Hα velocity-map outliers | 13.2% → 0.4% | 17.1% → 0.8% |
+| `rchisq_w` > 3 | 6.5% → 1.9% | 21.6% → 11.6% |
+| spaxels better / worse by > 10% | 26.9% / 0.8% | 45.6% / 7.2% |
+
+Seeding adds ~20 s per cube.
+
+### Output format
+
+- A seeded batch run writes `*_vseed_Fit.csv`, so it never overwrites the unseeded
+  baseline. It also writes `*_vseed_seeds.fits`: the seed in the primary HDU, plus
+  `VRAW`, `SNR`, `FRAC`, `TRUSTED`, `WINDOW` and a `LINES` table, with the seed recipe in
+  the header. `vel_init_kms` records each line's seeded start. Unseeded output is
+  unchanged.
+
+### Added — self-sky: Write to FITS / Restore original FITS
+
+`HyperCube_SelfSky.write_sky_to_fits` / `restore_sky_from_backup` (tests in
+`test_selfsky.py`, now 30), and two buttons in the Self-Sky dialog.
+
+- **Backup first, read from disk.** `<cube>_preSelfSky.fits` holds `ORIG_SCI` (plus
+  `ORIG_ERR`, `SKY`, `SKY_VAR`), copied from the FILE before anything is written. The
+  in-memory pristine cube can be a memory map of that very file.
+- **Only changed voxels are rewritten**, divided by the session flux scale back into file
+  units. The error extension (same file or sidecar; variance, inverse variance or σ)
+  gets the sky variance in its own convention. Everything else stays bit-identical, and
+  Restore is verified byte-exact before the backup is deleted.
+- **No double subtraction.** The science header gets `HCSKYSUB=T` plus the recipe, and
+  `SELFSKY_IN_FILE` mirrors it on load. Once that is set:
+  - *Apply* refuses.
+  - A session's `selfsky_spec` is not re-applied.
+  - Fit CSV provenance says `in FITS file`.
+  - The title shows `[self-sky in FITS]`.
+
+  After writing, the in-memory correction is dropped. Otherwise an in-memory Revert would
+  un-correct the data while the file stayed corrected.
+
+### Added — Export alignment
+
+**📤 Export alignment** in the *Background Image* dialog writes the Align X/Y shift as a
+sky offset (ΔRA east-positive, ΔDec, arcsec) to `<cube>.hst_alignment.json`. This is an
+alternative to *Update cube WCS from alignment* for when the goal is registered maps
+rather than a re-registered cube. The cube and its WCS are not changed and nothing needs
+refitting. The current CRPIX/CRVAL are recorded so a reader can refuse the offset once
+the WCS has changed.
+
+### Changed — Mask Spaxels speed
+
+- `_rectify_available_maps` built every map with `iterrows`, which took 8.8 s on a
+  19k-spaxel KCWI fit every time the dialog opened. It is now vectorised: 0.29 s, with
+  identical output.
+- S/N-tab lines start **unticked**. A line's S/N is computed only when it is ticked, via
+  `snr_line_map`, and cached in memory and in `<cube>.snr_cache.npz` beside the cube.
+  The key includes:
+  - the cube file's size and modification time
+  - the flux scale
+  - any in-memory self-sky digest
+  - the line centre and windows
+  - `_SNR_FORMULA_VERSION`
+
+  So the cache invalidates itself rather than needing to be cleared.
+
+### Changed — pPXF
+
+- `fit_stellar` takes `mask_dv` (half-width in km/s of the window masked around each
+  emission-line centroid; default 500, as before).
+
+---
+
 ## [v0.5.0] — 2026-09-15
 
 Rest-frame fitting templates and headless batch mode, self-sky subtraction, and a single
@@ -947,6 +1054,8 @@ which comes from lmfit's bounded-parameter covariance transform.
 
 Initial tagged release.
 
+[v0.5.1]: https://github.com/jkader925/HyperCube/releases/tag/v0.5.1
+[v0.5.0]: https://github.com/jkader925/HyperCube/releases/tag/v0.5.0
 [v0.4.0]: https://github.com/jkader925/HyperCube/releases/tag/v0.4.0
 [v0.3.0]: https://github.com/jkader925/HyperCube/releases/tag/v0.3.0
 [v0.2.0]: https://github.com/jkader925/HyperCube/releases/tag/v0.2.0

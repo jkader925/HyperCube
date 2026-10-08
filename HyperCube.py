@@ -8,7 +8,7 @@ Created on Fri Mar 28 15:01:22 2025
 
 # Real module attribute (it used to sit inside the docstring, where nothing could
 # read it and it went stale). Keep in step with CHANGELOG.md and the git tag.
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 
 
@@ -64,6 +64,7 @@ import HyperCube_Templates as hct  # Qt-free rest-frame model templates
 import HyperCube_Quality as hcq  # Qt-free fit-quality criteria (Rectify goodness)
 import HyperCube_SmartConstraints as hcsc  # Qt-free auto-constraint/K-group logic
 import HyperCube_SelfSky as hcss  # Qt-free self-sky subtraction (SPEC: HyperCube_SelfSky_SPEC.md)
+import HyperCube_VelocitySeed as hcvs  # Qt-free per-spaxel velocity seeds for cube fits
 try:
     import HyperCube_pPXF as hcppxf
 except Exception as _e:
@@ -90,18 +91,40 @@ SELFSKY_ORIG_SIGMA = None   # ndarray  — ERROR_CUBE before the variance penalt
 SELFSKY_RESULT = None       # hcss.SkyResult
 SELFSKY_MASK = None         # bool (ny, nx) — stored so a session can rebuild
 SELFSKY_INFO = {}           # provenance dict written to the fit CSV
+# The loaded FILE already holds a subtraction (written by "Write to FITS"):
+# the science header's HCSKY* record, else None. Distinct from an in-memory
+# correction -- the data on disk are corrected, so nothing may subtract again.
+SELFSKY_IN_FILE = None
 
 
 def selfsky_active():
     return SELFSKY_RESULT is not None
 
 
+def sync_selfsky_file_state(header):
+    """Read the HCSKY* record from a freshly loaded science header."""
+    global SELFSKY_IN_FILE
+    try:
+        flagged = header is not None and bool(header.get(hcss.SKY_FLAG, False))
+    except Exception:
+        flagged = False
+    SELFSKY_IN_FILE = ({k: header.get(k) for k in hcss.SKY_KEYS if k in header}
+                       if flagged else None)
+
+
 def selfsky_provenance():
     """Provenance columns for the fit CSV's scale/units block.
 
     A silently sky-corrected cube must not be indistinguishable from an
-    uncorrected one in the fit output (SPEC 2.7).
+    uncorrected one in the fit output (SPEC 2.7) -- including one whose
+    correction was written into the FITS file itself.
     """
+    if SELFSKY_IN_FILE is not None:
+        return {'selfsky_applied': 'in FITS file',
+                'selfsky_statistic': SELFSKY_IN_FILE.get('HCSKYSTA', ''),
+                'selfsky_mode': SELFSKY_IN_FILE.get('HCSKYMOD', ''),
+                'selfsky_n_mask': SELFSKY_IN_FILE.get('HCSKYNM', ''),
+                'selfsky_written': SELFSKY_IN_FILE.get('HCSKYDAT', '')}
     if not selfsky_active():
         return {'selfsky_applied': False}
     return dict(SELFSKY_INFO)
@@ -118,6 +141,19 @@ def apply_selfsky(cube_corrected, sigma_corrected, result, mask, info):
     if sigma_corrected is not None:
         ERROR_CUBE = sigma_corrected
     SELFSKY_RESULT, SELFSKY_MASK, SELFSKY_INFO = result, mask, dict(info)
+
+
+def bake_selfsky_into_file_state(file_record):
+    """After "Write to FITS": the loaded data now ARE the file's data, so drop the
+    in-memory correction (there is nothing left to revert in memory -- Revert
+    would restore the uncorrected cube while the file stays corrected) and
+    record the correction as belonging to the file."""
+    global SELFSKY_ORIG_CUBE, SELFSKY_ORIG_SIGMA, SELFSKY_RESULT, SELFSKY_MASK, SELFSKY_INFO
+    global SELFSKY_IN_FILE
+    SELFSKY_ORIG_CUBE = SELFSKY_ORIG_SIGMA = None
+    SELFSKY_RESULT = SELFSKY_MASK = None
+    SELFSKY_INFO = {}
+    SELFSKY_IN_FILE = dict(file_record)
 
 
 def revert_selfsky():
@@ -310,6 +346,80 @@ def invalidate_snr_cache(reason=''):
     if _SNR_CACHE.get('map') is not None and reason:
         print(f'S/N map cache cleared ({reason}).')
     _SNR_CACHE = {'key': None, 'map': None}
+
+
+# Per-LINE S/N maps for the Mask Spaxels S/N tab. A line's map is computed the
+# first time that line is ticked and then kept -- in memory for the session and
+# in `<cube>.snr_cache.npz` beside the cube for later sessions -- so re-opening
+# the dialog, or ticking lines in a different combination, never recomputes it.
+# The key carries everything the map depends on, so it cannot go stale: the
+# cube file (name, size, modification time -- a "Write to FITS" changes it), the
+# flux scale, any in-memory self-sky correction, the line centre, the windows
+# (which follow the wavelength sampling) and the S/N formula version.
+_SNR_LINE_CACHE = {}
+_SNR_LINE_DISK_LOADED = set()
+
+
+def _snr_line_key(cube_path, centroid, windows, flux_scale):
+    import hashlib
+    parts = [f'v{_SNR_FORMULA_VERSION}', f'cen={float(centroid):.4f}',
+             'win=' + ','.join(f'{w:.6f}' for w in windows),
+             f'scale={flux_scale}', f'shape={tuple(np.shape(FITS_DATA))}']
+    if cube_path and os.path.exists(cube_path):
+        st = os.stat(cube_path)
+        parts += [os.path.basename(cube_path), str(st.st_size), str(int(st.st_mtime))]
+    else:
+        parts.append(f'mem={id(FITS_DATA)}')         # no file: this array only
+    if selfsky_active():
+        sky = np.ascontiguousarray(np.asarray(SELFSKY_RESULT.sky, dtype=np.float64))
+        parts.append('sky=' + hashlib.sha1(sky.tobytes()).hexdigest()[:16])
+    return '|'.join(parts)
+
+
+def _snr_disk_path(cube_path):
+    return (os.path.splitext(cube_path)[0] + '.snr_cache.npz'
+            if cube_path and os.path.exists(cube_path) else None)
+
+
+def _snr_disk_name(key):
+    import hashlib
+    return 'k' + hashlib.sha1(key.encode()).hexdigest()[:24]
+
+
+def snr_line_map(centroid, cube_path=None, flux_scale=1.0):
+    """This line's per-spaxel S/N map (the shared `compute_snr_map` definition),
+    computed at most once per cube state. Returns (map, was_cached)."""
+    d_lam = float(np.median(np.diff(np.asarray(wavelengths, dtype=float))))
+    windows = (50 * d_lam, 60 * d_lam, 70 * d_lam)
+    key = _snr_line_key(cube_path, centroid, windows, flux_scale)
+    if key in _SNR_LINE_CACHE:
+        return _SNR_LINE_CACHE[key], True
+    disk = _snr_disk_path(cube_path)
+    name = _snr_disk_name(key)
+    if disk and os.path.exists(disk):
+        try:
+            with np.load(disk) as z:
+                if name in z.files:
+                    _SNR_LINE_CACHE[key] = np.asarray(z[name], dtype=float)
+                    return _SNR_LINE_CACHE[key], True
+        except Exception as e:
+            print(f'S/N cache {os.path.basename(disk)} unreadable ({e}); recomputing.')
+    maps = compute_snr_map(FITS_DATA, wavelengths, [centroid], *windows, per_line=True)
+    snr = np.asarray(maps[0], dtype=float) if maps else np.zeros(np.shape(FITS_DATA)[1:])
+    _SNR_LINE_CACHE[key] = snr
+    if disk:
+        try:
+            stored = {}
+            if os.path.exists(disk):
+                with np.load(disk) as z:
+                    stored = {k: z[k] for k in z.files}
+            stored[name] = snr.astype(np.float32)
+            tmp = disk + '.tmp.npz'
+            np.savez_compressed(tmp, **stored)
+            os.replace(tmp, disk)
+        except Exception as e:
+            print(f'S/N cache could not be written beside the cube ({e}); kept in memory only.')
+    return snr, False
 
 data_observation_init = {'sourcename': [''],
                     'redshift': [''],
@@ -3320,6 +3430,18 @@ class ViewerWindow(QMainWindow):
             "QPushButton:hover { background-color:#55585a; }"
         )
         lock_row.addWidget(restore_btn)
+        export_btn = QPushButton('📤 Export alignment')
+        export_btn.setFixedHeight(ui_px(26))
+        export_btn.setToolTip('Write the Align X/Y shift, as a sky offset, to '
+                              '<cube>.hst_alignment.json beside the cube. The cube '
+                              'and its WCS are NOT changed and nothing needs refitting: '
+                              'plotting tools apply the offset when maps are drawn.')
+        export_btn.setStyleSheet(
+            "QPushButton { background-color:#3c3f41; color:#eff0f1; border:1px solid #666;"
+            "  border-radius:3px; padding:2px 8px; }"
+            "QPushButton:hover { background-color:#55585a; }"
+        )
+        lock_row.addWidget(export_btn)
         lock_row.addStretch()
         layout.addLayout(lock_row)
 
@@ -3349,6 +3471,8 @@ class ViewerWindow(QMainWindow):
             lambda: self._lock_in_wcs(bkg_dx_spin, bkg_dy_spin, status))
         restore_btn.clicked.connect(
             lambda: self._restore_original_wcs(bkg_dx_spin, bkg_dy_spin, status))
+        export_btn.clicked.connect(
+            lambda: self._export_alignment(bkg_dx_spin, bkg_dy_spin, status))
 
         def _fetch(hips_url, label):
             status.setText(f'Fetching {label} image…')
@@ -3730,6 +3854,71 @@ class ViewerWindow(QMainWindow):
         if status_label:
             status_label.setText(f'✓ WCS locked in (CRPIX += {dx}, {dy}). '
                                  f'Original saved to {bkname}.')
+
+    def _export_alignment(self, dx_spin, dy_spin, status_label):
+        """Write the Align X/Y shift as a sky offset, WITHOUT touching the cube.
+
+        The alternative to `_lock_in_wcs` when the goal is registered maps
+        rather than a re-registered cube: a fit is made on native pixels and
+        does not depend on the WCS, so a plotting tool can apply the offset at
+        draw time and nothing needs refitting.
+
+        The sky shift is the one `_lock_in_wcs` would impose. Locking in sets
+        CRPIX += (dx, dy), after which pixel p carries the old sky coordinate of
+        p - d; so the offset to ADD to a position computed from the current WCS
+        is sky(c - d) - sky(c), evaluated at the cube centre c and reported as
+        (dRA east-positive, dDec) in arcsec. The current CRPIX/CRVAL are
+        recorded so a reader can refuse the offset once the WCS has changed.
+        """
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        from astropy.io import fits as _fits
+        from astropy.wcs import WCS as _WCS
+        path = getattr(self, 'fits_path', None)
+        if not path or not os.path.exists(path):
+            if status_label: status_label.setText('No cube file on disk to export for.')
+            return
+        dx = int(dx_spin.value()); dy = int(dy_spin.value())
+        ext = getattr(self, 'fits_ext', 0)
+        try:
+            with _fits.open(path, memmap=True) as hdul:
+                if not (ext < len(hdul) and 'CRPIX1' in hdul[ext].header):
+                    ext = next((i for i in range(len(hdul))
+                                if 'CRPIX1' in hdul[i].header), ext)
+                hdr = hdul[ext].header.copy()
+            wcs = _WCS(hdr).celestial
+            nx = int(hdr.get('NAXIS1', FITS_DATA.shape[-1] if FITS_DATA is not None else 1))
+            ny = int(hdr.get('NAXIS2', FITS_DATA.shape[-2] if FITS_DATA is not None else 1))
+            cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
+            here = wcs.pixel_to_world(cx, cy)
+            there = wcs.pixel_to_world(cx - dx, cy - dy)
+            dra, ddec = here.spherical_offsets_to(there)
+            record = {
+                'cube': os.path.basename(path),
+                'cube_path': path,
+                'extension': ext,
+                'background': getattr(self, '_bkg_label', ''),
+                'dx_pix': dx,
+                'dy_pix': dy,
+                'sky_shift_dra_arcsec': round(float(dra.to_value('arcsec')), 4),
+                'sky_shift_ddec_arcsec': round(float(ddec.to_value('arcsec')), 4),
+                'convention': ('ADD (dRA east-positive, dDec) to sky positions computed '
+                               'from the recorded WCS to register onto the background'),
+                'wcs': {k: float(hdr[k]) for k in ('CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2')
+                        if k in hdr},
+                'exported_utc': _dt.now(_tz.utc).isoformat(timespec='seconds'),
+            }
+            out = os.path.splitext(path)[0] + '.hst_alignment.json'
+            with open(out, 'w') as fh:
+                _json.dump(record, fh, indent=2)
+        except Exception as e:
+            if status_label: status_label.setText(f'Export failed: {e}')
+            return
+        if status_label:
+            status_label.setText(
+                f'✓ Exported ({dx}, {dy}) px = ΔRA {record["sky_shift_dra_arcsec"]:+.2f}″, '
+                f'ΔDec {record["sky_shift_ddec_arcsec"]:+.2f}″ to {os.path.basename(out)} '
+                f'(cube unchanged)')
 
     def _restore_original_wcs(self, dx_spin, dy_spin, status_label):
         """Restore the cube WCS from the `*_oldWCS.fits` backup."""
@@ -4350,7 +4539,8 @@ class ViewerWindow(QMainWindow):
 
                 FITS_HEADER = self.fits_header
                 FITS_DATA = self.fits_data
-                
+                sync_selfsky_file_state(FITS_HEADER)
+
                 # Handle different data types
                 if self.is_bintable:
                     print("Binary table detected - showing column selection")
@@ -4674,6 +4864,12 @@ class ViewerWindow(QMainWindow):
 
         # 1b) Self-sky: rebuild the correction from the stored mask.
         _sspec = session.get('selfsky_spec')
+        if _sspec is not None and SELFSKY_IN_FILE is not None:
+            # The session predates "Write to FITS": the file on disk already
+            # holds this subtraction, and re-applying it would subtract twice.
+            print('Session: self-sky NOT re-applied — the FITS file already has a '
+                  f"subtraction written into it ({SELFSKY_IN_FILE.get('HCSKYDAT', '')}).")
+            _sspec = None
         if _sspec is not None and FITS_DATA is not None:
             try:
                 _res = hcss.build_sky(FITS_DATA, _sspec['mask'],
@@ -7468,6 +7664,8 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         df = df
         self.fitloaded = False
         self._sequential_fit = False   # sequential core→outflow fit mode (off by default)
+        self._velocity_seed_fit = False  # per-spaxel velocity-seeded cube fits (off by default)
+        self._last_velocity_seeds = None  # hcvs.SeedResult of the last seeded cube fit
         self.current_line = current_line
         self.setWindowTitle("Fit Parameters")
         
@@ -8693,6 +8891,22 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         self.sequential_fit_checkbox.setMinimumWidth(_seq_w + 24)
         row2.addWidget(self.sequential_fit_checkbox)
 
+        # Per-spaxel velocity seeds for Fit Cube (HyperCube_VelocitySeed)
+        self.velocity_seed_checkbox = QCheckBox('V-seed')
+        self.velocity_seed_checkbox.setChecked(getattr(self, '_velocity_seed_fit', False))
+        self.velocity_seed_checkbox.setToolTip(
+            'Velocity-seeded Fit Cube: before fitting, measure each spaxel\'s\n'
+            'velocity by matching all lines of a fit to the mean spectrum, median-\n'
+            'filter the map, and start every spaxel\'s line centroids (and any\n'
+            'centroid bounds) at that shift. Amplitudes, widths and components\n'
+            'still start from the model. Use when rotation moves lines far from\n'
+            'the initial guesses. Adds a few seconds; cube fits only.')
+        self.velocity_seed_checkbox.toggled.connect(
+            lambda checked: setattr(self, '_velocity_seed_fit', bool(checked)))
+        self.velocity_seed_checkbox.setMinimumWidth(
+            self.velocity_seed_checkbox.sizeHint().width() + 24)
+        row2.addWidget(self.velocity_seed_checkbox)
+
         row2.addSpacing(12)
         row2.addWidget(_vsep())
 
@@ -8840,24 +9054,34 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         """
         maps = []
 
+        def _num(frame, name):
+            if name in frame.columns:
+                return pd.to_numeric(frame[name], errors='coerce').astype(float)
+            return pd.Series(np.nan, index=frame.index, dtype=float)
+
         def _per_spaxel_col(frame, col, conv=None):
-            out = {}
-            for _, rr in frame.iterrows():
+            """{(x, y): value} for one map, vectorised.
+
+            Was a row-by-row iterrows loop, called once per map: ~9 s for a
+            19k-spaxel KCWI fit, redone every time the Mask dialog opened. `conv`
+            now derives the value from the whole frame (a derived quantity such as
+            flux has no stored column); non-numeric entries become NaN, and a
+            later row for the same spaxel wins, exactly as before.
+            """
+            if 'spaxel_x' not in frame.columns or 'spaxel_y' not in frame.columns:
+                return {}
+            xs = pd.to_numeric(frame['spaxel_x'], errors='coerce')
+            ys = pd.to_numeric(frame['spaxel_y'], errors='coerce')
+            if conv is not None:
                 try:
-                    x, y = int(rr['spaxel_x']), int(rr['spaxel_y'])
-                except (TypeError, ValueError, KeyError):
-                    continue
-                v = _safe_float(rr.get(col))
-                # The converter is called even when `col` itself is absent: a
-                # derived quantity (flux) has no stored column and builds its
-                # value from the row. Converters return NaN on bad input.
-                if conv is not None:
-                    try:
-                        v = _safe_float(conv(rr, v))
-                    except Exception:
-                        v = np.nan
-                out[(x, y)] = v
-            return out
+                    vals = pd.Series(np.asarray(conv(frame), dtype=float), index=frame.index)
+                except Exception:
+                    vals = pd.Series(np.nan, index=frame.index, dtype=float)
+            else:
+                vals = _num(frame, col)
+            ok = (xs.notna() & ys.notna()).to_numpy()
+            keys = zip(xs.to_numpy()[ok].astype(int).tolist(), ys.to_numpy()[ok].astype(int).tolist())
+            return dict(zip(keys, vals.to_numpy()[ok].tolist()))
 
         # ── Quality metrics (per-spaxel; one value repeated across line rows) ──
         if isinstance(df_fit, pd.DataFrame) and len(df_fit) > 0:
@@ -8897,17 +9121,19 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                         elif col not in df_fit.columns:
                             continue
                         if col == 'sigma_fit':
-                            conv = lambda rr, v: sigma_wl_to_kms(
-                                _safe_float(rr.get('sigma_fit')),
-                                _safe_float(rr.get('cen_fit')))
+                            # sigma_wl_to_kms, vectorised: NaN where the centroid
+                            # is missing or zero.
+                            def conv(fr):
+                                s, c = _num(fr, 'sigma_fit'), _num(fr, 'cen_fit')
+                                good = np.isfinite(s) & np.isfinite(c) & (c != 0)
+                                return np.where(good, C_KMS * s / c.where(good, 1.0), np.nan)
                         elif col == 'flux':
                             # Integrated Gaussian flux, amp * sigma_lambda * sqrt(2pi).
                             # Not a stored column, so derive it from the row; sigma
                             # is held in A, which is exactly what this needs.
-                            conv = lambda rr, v: (
-                                _safe_float(rr.get('amp_fit'))
-                                * _safe_float(rr.get('sigma_fit'))
-                                * np.sqrt(2.0 * np.pi))
+                            def conv(fr):
+                                return (_num(fr, 'amp_fit') * _num(fr, 'sigma_fit')
+                                        * np.sqrt(2.0 * np.pi))
                         else:
                             conv = None
                         vals = _per_spaxel_col(sub, col, conv=conv)
@@ -9634,6 +9860,22 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             btns.addWidget(b)
         lay.addLayout(btns)
 
+        # Writing the correction into the cube file, like "Update cube WCS from
+        # alignment": the original arrays go to <cube>_preSelfSky.fits first, and
+        # Restore puts them back exactly.
+        file_btns = QHBoxLayout()
+        b_write = QPushButton('💾 Write to FITS…')
+        b_write.setToolTip('Write the applied sky subtraction (and the error cube\'s added '
+                           'sky variance) into the FITS file. The original arrays are '
+                           'saved to <cube>_preSelfSky.fits first.')
+        b_restore = QPushButton('↩ Restore original FITS…')
+        b_restore.setToolTip('Put the original arrays back from <cube>_preSelfSky.fits '
+                             '(verified, then the backup is deleted).')
+        file_btns.addWidget(b_write)
+        file_btns.addWidget(b_restore)
+        file_btns.addStretch()
+        lay.addLayout(file_btns)
+
         def _protected():
             lo, hi = sorted((p0.value(), p1.value()))
             return None if hi - lo <= 0 else (lo, hi)
@@ -9802,6 +10044,13 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             vw.show_sky_region_preview(np.where(live, m.astype(float), np.nan))
 
         def _apply():
+            if SELFSKY_IN_FILE is not None:
+                QMessageBox.warning(
+                    self, 'Self-Sky',
+                    'This FITS file already has a self-sky subtraction written into it '
+                    f"({SELFSKY_IN_FILE.get('HCSKYDAT', '')}). Applying another would "
+                    'subtract the sky twice.\n\nUse "Restore original FITS" first.')
+                return
             m = _combined()
             if m is None:
                 return
@@ -9875,10 +10124,133 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                         w_.writerow([lam] + list(res.sky[i]))
             QMessageBox.information(self, 'Self-Sky', f'Wrote {path}')
 
+        def _cube_path():
+            p = getattr(vw, 'fits_path', None)
+            return p if p and os.path.exists(p) else None
+
+        def _write_fits():
+            path = _cube_path()
+            if not selfsky_active():
+                QMessageBox.information(self, 'Self-Sky', 'Apply a correction first.')
+                return
+            if path is None:
+                QMessageBox.information(self, 'Self-Sky', 'No cube file on disk to write to.')
+                return
+            sci_ext = int(getattr(vw, 'fits_ext', 0))
+            err = None
+            e_path, e_ext = ERROR_INFO.get('path'), ERROR_INFO.get('ext')
+            if (ERROR_CUBE is not None and SELFSKY_ORIG_SIGMA is not None
+                    and e_path and e_ext is not None and os.path.exists(e_path)):
+                err = dict(path=e_path, ext=int(e_ext),
+                           kind=ERROR_INFO.get('kind') or HyperCube_Noise.KIND_SIGMA,
+                           corrected=ERROR_CUBE, pristine=SELFSKY_ORIG_SIGMA)
+            backup = hcss.sky_backup_path(path)
+            gb = (np.asarray(FITS_DATA).nbytes
+                  + (np.asarray(ERROR_CUBE).nbytes if err else 0)) / 1e9
+            err_line = (f"\n• The error cube ({os.path.basename(err['path'])} ext {err['ext']}, "
+                        f"{err['kind']}) gets the sky estimate's variance added."
+                        if err else '\n• No error cube on disk to update (empirical noise).')
+            if QMessageBox.question(
+                    self, 'Write self-sky to FITS',
+                    f'Write the sky-subtracted spectra into\n{os.path.basename(path)} (ext {sci_ext})?'
+                    f'{err_line}\n• First, the original arrays are copied to\n'
+                    f'  {os.path.basename(backup)} (~{gb:.1f} GB).\n'
+                    '• Only voxels the correction changed are rewritten.\n\n'
+                    'Restore original FITS puts the file back exactly.',
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            try:
+                fscale = float(np.float64(getattr(vw, 'fluxscalefactor', 1) or 1))
+            except (TypeError, ValueError):
+                fscale = 1.0
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                summary = hcss.write_sky_to_fits(
+                    path, sci_ext, FITS_DATA, SELFSKY_ORIG_CUBE, fscale, error=err,
+                    result=SELFSKY_RESULT, provenance=SELFSKY_INFO)
+                record = hcss.file_sky_state(path, sci_ext) or {}
+            except hcss.SkyFileError as exc:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(self, 'Self-Sky', str(exc))
+                return
+            except Exception as exc:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, 'Self-Sky', f'Write failed: {exc}')
+                return
+            QApplication.restoreOverrideCursor()
+            # Keep the in-memory header in step with the file.
+            for h in (getattr(vw, 'fits_header', None), FITS_HEADER):
+                if h is not None:
+                    for k, v in record.items():
+                        h[k] = v
+            bake_selfsky_into_file_state(record)
+            self._selfsky_sync_title()
+            _refresh_buttons()
+            QMessageBox.information(
+                self, 'Self-Sky',
+                f"Written: {summary['sci_voxels_changed']:,} data voxels"
+                + (f", {summary['err_voxels_changed']:,} error voxels" if err else '')
+                + f".\nBackup: {os.path.basename(summary['backup'])}")
+
+        def _restore_fits():
+            global FITS_DATA
+            path = _cube_path()
+            if path is None or not os.path.exists(hcss.sky_backup_path(path)):
+                QMessageBox.information(self, 'Self-Sky', 'No self-sky backup found for this cube.')
+                return
+            if QMessageBox.question(
+                    self, 'Restore original FITS',
+                    f'Put the original arrays back into {os.path.basename(path)} from\n'
+                    f'{os.path.basename(hcss.sky_backup_path(path))}?\n\n'
+                    'The restore is verified before the backup is deleted.',
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            if selfsky_active():
+                revert_selfsky()          # an in-memory correction on top would be stale
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                out = hcss.restore_sky_from_backup(path)
+            except Exception as exc:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, 'Self-Sky', f'Restore failed: {exc}')
+                return
+            try:
+                fscale = float(np.float64(getattr(vw, 'fluxscalefactor', 1) or 1))
+            except (TypeError, ValueError):
+                fscale = 1.0
+            original = out['original']
+            FITS_DATA = original * fscale if fscale != 1.0 else original
+            vw.fits_data = FITS_DATA
+            for h in (getattr(vw, 'fits_header', None), FITS_HEADER):
+                if h is not None:
+                    for k in hcss.SKY_KEYS:
+                        if k in h:
+                            del h[k]
+            sync_selfsky_file_state(FITS_HEADER)
+            if out['error_restored'] and ERROR_INFO.get('path'):
+                try:
+                    vw.apply_error_cube_spec({k: ERROR_INFO.get(k)
+                                              for k in ('mode', 'path', 'ext', 'kind', 'label')})
+                except Exception as exc:
+                    print(f'Self-Sky restore: error cube could not be reloaded ({exc}).')
+            invalidate_snr_cache('self-sky restored from backup')
+            QApplication.restoreOverrideCursor()
+            vw.clear_mask_preview()
+            vw.redraw_current_image()
+            self._selfsky_sync_title()
+            _refresh_buttons()
+            QMessageBox.information(self, 'Self-Sky', 'Original FITS restored and verified; '
+                                                      'backup deleted.')
+
         def _refresh_buttons():
             b_revert.setEnabled(selfsky_active())
             b_export.setEnabled(selfsky_active())
+            path = _cube_path()
+            b_write.setEnabled(selfsky_active() and SELFSKY_IN_FILE is None and path is not None)
+            b_restore.setEnabled(path is not None and os.path.exists(hcss.sky_backup_path(path)))
 
+        b_write.clicked.connect(_write_fits)
+        b_restore.clicked.connect(_restore_fits)
         b_add.clicked.connect(_add_menu)
         b_del.clicked.connect(_remove)
         b_prev.clicked.connect(_preview)
@@ -9898,7 +10270,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         if base is None:
             base = vw.windowTitle()
             vw._base_window_title = base
-        vw.setWindowTitle(base + ('  [self-sky subtracted]' if selfsky_active() else ''))
+        suffix = ('  [self-sky subtracted]' if selfsky_active() else
+                  '  [self-sky in FITS]' if SELFSKY_IN_FILE is not None else '')
+        vw.setWindowTitle(base + suffix)
 
     CHANMAP_MASK_LABEL = 'C-region (channel map)'
 
@@ -10015,10 +10389,15 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         return out
 
     def _snr_per_line_maps(self, centroids):
-        """Per-line S/N maps for the given centroids, via the shared function."""
-        d_lam = float(np.median(np.diff(np.asarray(wavelengths, dtype=float))))
-        return compute_snr_map(FITS_DATA, wavelengths, centroids,
-                               50 * d_lam, 60 * d_lam, 70 * d_lam, per_line=True)
+        """Per-line S/N maps for the given centroids, from the permanent per-line
+        cache (`snr_line_map`): each line is computed once, ever, per cube state."""
+        vw = self.viewer_window
+        path = getattr(vw, 'fits_path', None)
+        try:
+            fscale = float(np.float64(getattr(vw, 'fluxscalefactor', 1) or 1))
+        except (TypeError, ValueError):
+            fscale = 1.0
+        return [snr_line_map(c, path, fscale)[0] for c in centroids]
 
     def mask_spaxels(self):
         """Two-tab spatial mask over the cube: keep spaxels that satisfy a
@@ -10277,7 +10656,9 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         for r, (_i, lbl, cen) in enumerate(snr_lines):
             it = QTableWidgetItem(lbl)
             it.setFlags((it.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
-            it.setCheckState(Qt.Checked)
+            # Unticked: S/N is computed only for a line the user ticks, never on
+            # opening the dialog (see snr_line_map for the permanent cache).
+            it.setCheckState(Qt.Unchecked)
             line_tbl.setItem(r, 0, it)
             wl_it = QTableWidgetItem(f'{cen:.2f}')
             wl_it.setFlags(Qt.ItemIsEnabled)
@@ -10331,8 +10712,6 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         slay.addWidget(snr_preview)
         slay.addStretch()
 
-        _snr_cache = {'key': None, 'maps': None}
-
         def _snr_checked():
             """[(label, centroid, threshold)] for every ticked line."""
             out = []
@@ -10357,16 +10736,17 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                                     'define lines in the model first.')
             cens = [c for _l, c, _t in picked]
             thrs = [t for _l, _c, t in picked]
-            # Cache on the CENTROIDS only: the maps do not depend on the
-            # thresholds, and the user moves thresholds constantly.
-            key = tuple(np.round(cens, 6))
-            if _snr_cache['key'] != key:
-                try:
-                    _snr_cache['maps'] = self._snr_per_line_maps(cens)
-                    _snr_cache['key'] = key
-                except Exception as e:
-                    return None, None, f'S/N could not be computed: {e}'
-            maps = _snr_cache['maps']
+            # Per-line maps come from the permanent cache: a line already
+            # computed (this session, a previous open of this dialog, or a
+            # previous session via the .snr_cache.npz beside the cube) is reused;
+            # only a newly ticked line is computed. Thresholds never recompute.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                maps = self._snr_per_line_maps(cens)
+            except Exception as e:
+                return None, None, f'S/N could not be computed: {e}'
+            finally:
+                QApplication.restoreOverrideCursor()
             if not maps:
                 return None, None, 'No usable S/N maps for the ticked lines.'
             tok = OPS[snr_op.currentIndex()][1]
@@ -12808,14 +13188,18 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         except Exception:
             return default
 
-    def _fit_cube_serial(self, gated, params, z, progress_bar, status_label, total):
+    def _fit_cube_serial(self, gated, params, z, progress_bar, status_label, total,
+                         seed_vel=None):
         """Serial per-spaxel fit over `gated` spaxels (the fallback path and the
         correctness oracle). Returns the list of stellar-kinematics rows; line
-        rows are appended to the global fit_results by fit_spaxel."""
+        rows are appended to the global fit_results by fit_spaxel.
+
+        `seed_vel` (km/s per `gated` spaxel, NaN = none) shifts each spaxel's
+        line centroids exactly as the parallel path does."""
         from PyQt5.QtWidgets import QApplication
         _stellar_preps = self._stellar_cube_prep()
         _stellar_rows, done = [], 0
-        for (i, j) in gated:
+        for k, (i, j) in enumerate(gated):
             if self._fit_cancelled:
                 break
             if self.fit_progress_frame.isVisible() and psutil.virtual_memory().percent > 80:
@@ -12825,7 +13209,10 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                 _srow = self._stellar_fit_one(i, j, _prep)
                 if _srow is not None:
                     _stellar_rows.append(_srow)
-            self.fit_spaxel(z, max_nfev=512, params_to_use=params)
+            _p = params
+            if seed_vel is not None and np.isfinite(seed_vel[k]) and seed_vel[k] != 0.0:
+                _p = HyperCube_fit.shift_line_centroids(params, seed_vel[k])
+            self.fit_spaxel(z, max_nfev=512, params_to_use=_p)
             done += 1
             progress_bar.setValue(done)
             status_label.setText(f"Fitting spaxel {done} / {total}")
@@ -12835,7 +13222,7 @@ class FitParamsWindow(QtWidgets.QMainWindow):
         return _stellar_rows
 
     def _fit_cube_parallel(self, gated, params, z, n_regions, n_lines, n_workers,
-                           progress_bar, status_label, total):
+                           progress_bar, status_label, total, seed_vel=None):
         """Fit `gated` spaxels across `n_workers` processes. Line rows are
         appended to the global fit_results; returns the stellar-kinematics rows.
 
@@ -12883,9 +13270,38 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             sigma_label=(noise_source_label() if err is not None else None),
             sequential=bool(getattr(self, '_sequential_fit', False)),
             max_nfev=512, stellar_specs=stellar_specs, stellar_mask=stellar_mask,
-            progress_cb=_progress, is_cancelled=lambda: self._fit_cancelled)
+            progress_cb=_progress, is_cancelled=lambda: self._fit_cancelled,
+            seed_vel=seed_vel)
         fit_results.extend(line_rows)
         return _stellar_rows
+
+    def _velocity_seeds(self, gated, params, z, status_label):
+        """Per-spaxel velocity seeds (km/s, aligned with `gated`) for a cube fit,
+        or None if they could not be built — the fit then runs unseeded, and the
+        console says so rather than letting it pass for a seeded run."""
+        from PyQt5.QtWidgets import QApplication
+        status_label.setText(f'Measuring velocity seeds for {len(gated)} spaxels…')
+        QApplication.processEvents()
+        err = ERROR_CUBE if (ERROR_CUBE is not None
+                             and ERROR_CUBE.shape == FITS_DATA.shape) else None
+        try:
+            res = hcvs.build_seeds(
+                FITS_DATA, wavelengths, gated, params,
+                df.drop(columns=['curveactor'], errors='ignore').copy(),
+                df_cont.drop(columns=['lineactor'], errors='ignore').copy(),
+                float(z), err_cube=err,
+                sigma_label=(noise_source_label() if err is not None else None),
+                max_nfev=512, sequential=bool(getattr(self, '_sequential_fit', False)))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f'Velocity seeds failed ({type(e).__name__}: {e}); '
+                  f'fitting WITHOUT seeds.')
+            self._last_velocity_seeds = None
+            return None
+        self._last_velocity_seeds = res
+        print(f'{res.describe()} ({res.seconds:.1f} s)')
+        return [float(res.seed[j, i]) for (i, j) in gated]
 
     def _stellar_cube_prep(self):
         """Prepare a per-spaxel stellar fit across the cube. Returns a LIST of
@@ -13516,12 +13932,17 @@ class FitParamsWindow(QtWidgets.QMainWindow):
             progress_bar.setValue(0)
             n_workers = self._fit_worker_count()
 
+            seed_vel = None
+            if (getattr(self, '_velocity_seed_fit', False) and len(gated) > 1
+                    and not self.viewer_window.is_1d_spectrum):
+                seed_vel = self._velocity_seeds(gated, params, z, status_label)
+
             if (n_workers > 1 and len(gated) > 1
                     and not self.viewer_window.is_1d_spectrum):
                 try:
                     _stellar_rows = self._fit_cube_parallel(
                         gated, params, z, Nregions, Nlines, n_workers,
-                        progress_bar, status_label, total)
+                        progress_bar, status_label, total, seed_vel=seed_vel)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -13529,10 +13950,12 @@ class FitParamsWindow(QtWidgets.QMainWindow):
                           f"falling back to serial.")
                     fit_results.clear()
                     _stellar_rows = self._fit_cube_serial(
-                        gated, params, z, progress_bar, status_label, total)
+                        gated, params, z, progress_bar, status_label, total,
+                        seed_vel=seed_vel)
             else:
                 _stellar_rows = self._fit_cube_serial(
-                    gated, params, z, progress_bar, status_label, total)
+                    gated, params, z, progress_bar, status_label, total,
+                    seed_vel=seed_vel)
 
             if _has_stellar:
                 df_stellar = pd.DataFrame(_stellar_rows)

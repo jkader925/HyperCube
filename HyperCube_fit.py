@@ -55,10 +55,33 @@ def _as_float_list(v):
 
 
 # ── model construction ───────────────────────────────────────────────────────
+def shift_line_centroids(params, v_kms):
+    """Copy of `params` with every free line centroid Doppler-shifted by `v_kms`.
+
+    The per-spaxel velocity seed (`HyperCube_VelocitySeed`). Finite centroid
+    bounds move with the value: a bound anchored on systemic would otherwise
+    hold a rotating line away from where the seed just put it. Tied centroids
+    (`expr`) follow their reference and are left alone — `set(value=)` would
+    clear the tie — and so are centroids the user froze (`vary=False`).
+    `init_value` is updated, so the output's `vel_init` records the seed.
+    """
+    out = params.copy()
+    f = 1.0 + float(v_kms) / C_KMS
+    for name, p in out.items():
+        if not (name.startswith('cen') and name[3:].isdigit()):
+            continue
+        if p.expr or not p.vary or not np.isfinite(p.value):
+            continue
+        lo = p.min * f if (p.min is not None and np.isfinite(p.min)) else None
+        hi = p.max * f if (p.max is not None and np.isfinite(p.max)) else None
+        p.set(min=lo, max=hi, value=p.value * f)
+    return out
+
+
 def run_pool(cube, wavelengths, params, df, df_cont, z, R, gated, radec,
              n_workers, err_cube=None, sigma_label=None, sequential=False,
              max_nfev=512, stellar_specs=(), stellar_mask=None,
-             progress_cb=None, is_cancelled=None):
+             progress_cb=None, is_cancelled=None, seed_vel=None):
     """Fit `gated` spaxels across a process pool. Returns `(line_rows, stellar_rows)`.
 
     Lifted out of `FitParamsWindow._fit_cube_parallel`; the only things that
@@ -71,6 +94,10 @@ def run_pool(cube, wavelengths, params, df, df_cont, z, R, gated, radec,
     of the workers. `df`/`df_cont` must already have their matplotlib actor
     columns dropped and `df_cont` must be indexed 0..N-1 (fit_one_spaxel looks
     up `region_index` positionally).
+
+    `seed_vel`, if given, is a km/s velocity per `gated` spaxel (NaN = none)
+    that shifts that spaxel's line centroids before its fit
+    (`shift_line_centroids`). None leaves every task exactly as before.
     """
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -102,6 +129,8 @@ def run_pool(cube, wavelengths, params, df, df_cont, z, R, gated, radec,
         ras, decs = radec
         tasks = [(int(gated[k][0]), int(gated[k][1]), float(ras[k]), float(decs[k]))
                  for k in range(len(gated))]
+        if seed_vel is not None:
+            tasks = [t + (float(seed_vel[k]),) for k, t in enumerate(tasks)]
         total = len(tasks)
         print(f'Parallel Fit Cube: {total} spaxels across {n_workers} workers')
 
@@ -852,9 +881,12 @@ def _worker_init(ctx):
 
 
 def _worker_fit_one(task):
-    """Fit one spaxel in a worker. task = (i, j, ra, dec). Returns
+    """Fit one spaxel in a worker. task = (i, j, ra, dec[, seed_v_kms]). Returns
     (line_rows, stellar_rows) — both small, picklable lists of dicts."""
-    i, j, ra, dec = task
+    i, j, ra, dec = task[:4]
+    params = _W['params']
+    if len(task) > 4 and np.isfinite(task[4]) and task[4] != 0.0:
+        params = shift_line_centroids(params, task[4])
     wl = _W['wavelengths']
     flux = np.nan_to_num(_W['cube'][:, j, i].astype(float))
     err_cube = _W.get('err_cube')
@@ -876,7 +908,7 @@ def _worker_fit_one(task):
                 'success': True})
 
     line_rows = fit_one_spaxel(
-        flux, stellar_baseline, wl, _W['params'], _W['model'], _W['df'],
+        flux, stellar_baseline, wl, params, _W['model'], _W['df'],
         _W['df_cont'], _W['z'], _W['max_nfev'], _W['sequential'], (i, j),
         ra, dec, stellar_kin, sigma_in, _W.get('sigma_label'))
     return line_rows, stellar_rows

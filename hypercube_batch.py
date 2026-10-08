@@ -59,6 +59,7 @@ from astropy.wcs import WCS
 
 import HyperCube_LSF as hlsf
 import HyperCube_SelfSky as hcss
+import HyperCube_VelocitySeed as hvs
 import HyperCube_Templates as HT
 import HyperCube_fit as HF
 import HyperCube_Noise
@@ -152,6 +153,36 @@ def write_fit_csv(path, df_obs, df_cont, df, df_fit, df_stellar, flux_unit):
         if df_stellar is not None and len(df_stellar):
             out = HC.to_export_units(df_stellar)
             w.writerow(out.columns); w.writerows(out.values)
+    return path
+
+
+def write_seed_fits(path, seeds, wcs=None):
+    """The seed maps beside the fit, so a seeded run can be audited: what each
+    spaxel was shifted by, what it was measured as, and how far that could be
+    trusted."""
+    hdr = wcs.to_header() if wcs is not None else fits.Header()
+    hdr['BUNIT'] = 'km/s'
+    hdr['VSSRC'] = (seeds.template_source[:68], 'correlation template')
+    hdr['VSVMAX'] = (seeds.vmax, 'km/s, velocity search half-range')
+    hdr['VSDV'] = (seeds.dv, 'km/s, velocity grid step')
+    hdr['VSSMIN'] = (seeds.smin, 'matched-filter S/N needed to trust')
+    hdr['VSFMIN'] = (seeds.fmin, 'explained fraction needed to trust')
+    hdr.add_history(seeds.describe())
+    hdus = [fits.PrimaryHDU(seeds.seed.astype(np.float32), header=hdr)]
+    for name, arr, unit in (('VRAW', seeds.v_raw, 'km/s'), ('SNR', seeds.snr, ''),
+                            ('FRAC', seeds.frac, ''),
+                            ('TRUSTED', seeds.trusted.astype(np.uint8), ''),
+                            ('WINDOW', seeds.window.astype(np.int16), 'pix')):
+        h = wcs.to_header() if wcs is not None else fits.Header()
+        if unit:
+            h['BUNIT'] = unit
+        hdus.append(fits.ImageHDU(np.asarray(arr), header=h, name=name))
+    lines = seeds.lines
+    hdus.append(fits.BinTableHDU.from_columns(
+        [fits.Column(name='amp', format='D', array=lines[:, 0]),
+         fits.Column(name='cen_A', format='D', array=lines[:, 1]),
+         fits.Column(name='sigma_A', format='D', array=lines[:, 2])], name='LINES'))
+    fits.HDUList(hdus).writeto(path, overwrite=True)
     return path
 
 
@@ -274,6 +305,26 @@ def run_target(template, row, args, out_dir):
         sigma_label = f'{sigma_label} + self-sky'
     ras, decs = sky_coords(wcs, [g[0] for g in gated], [g[1] for g in gated])
 
+    # Ship exactly what the GUI ships: actor columns dropped, so the two paths
+    # hand the workers the same frames.
+    df_run = df.drop(columns=['curveactor'], errors='ignore').copy()
+    df_cont_run = df_cont.drop(columns=['lineactor'], errors='ignore').copy()
+
+    # Per-spaxel velocity seeds. A seeded product gets its own stem so it can
+    # never overwrite the unseeded fit it is meant to be compared against.
+    seed_vel, fit_stem = None, stem
+    if args.seed_velocity:
+        seeds = hvs.build_seeds(
+            data, wl, gated, params, df_run, df_cont_run, z, err_cube=err,
+            sigma_label=sigma_label, max_nfev=args.max_nfev,
+            sequential=args.sequential, vmax=args.seed_vmax, dv=args.seed_dv,
+            smin=args.seed_snr, fmin=args.seed_fmin)
+        seed_vel = [seeds.seed[j, i] for (i, j) in gated]
+        fit_stem = f'{stem}_vseed'
+        write_seed_fits(os.path.join(out_dir, f'{fit_stem}_seeds.fits'), seeds, wcs)
+        summary['seed_velocity'] = seeds.describe()
+        print(f'  [{tid}] {seeds.describe()} ({seeds.seconds:.1f}s)', flush=True)
+
     last = [0]
 
     def progress(done, total):
@@ -283,16 +334,12 @@ def run_target(template, row, args, out_dir):
             print(f'   {tid}: {done}/{total} spaxels ({pct:.0f}%)', flush=True)
 
     line_rows, stellar_rows = HF.run_pool(
-        cube=data, wavelengths=wl, params=params,
-        # Ship exactly what the GUI ships: actor columns dropped, so the two
-        # paths hand the workers the same frames.
-        df=df.drop(columns=['curveactor'], errors='ignore').copy(),
-        df_cont=df_cont.drop(columns=['lineactor'], errors='ignore').copy(),
+        cube=data, wavelengths=wl, params=params, df=df_run, df_cont=df_cont_run,
         z=z, R=float(lsf.R(np.median(wl))), gated=gated, radec=(ras, decs),
         n_workers=args.cores, err_cube=err, sigma_label=sigma_label,
         sequential=args.sequential, max_nfev=args.max_nfev,
         stellar_specs=stellar_specs, stellar_mask=stellar_mask,
-        progress_cb=progress)
+        progress_cb=progress, seed_vel=seed_vel)
 
     df_fit = pd.DataFrame(line_rows)
     df_stellar = pd.DataFrame(stellar_rows)
@@ -307,7 +354,7 @@ def run_target(template, row, args, out_dir):
                                if np.isfinite(v) else _SVG_COLORS[0]
                                for v in df_fit['LineID']]
 
-    csv_path = os.path.join(out_dir, f'{stem}_Fit.csv')
+    csv_path = os.path.join(out_dir, f'{fit_stem}_Fit.csv')
     write_fit_csv(csv_path, df_obs, df_cont, df, df_fit, df_stellar,
                   str(header.get('BUNIT', 'unknown')))
     summary.update(fitted=len(gated), csv=csv_path, status='fitted',
@@ -344,6 +391,19 @@ def main(argv=None):
     ap.add_argument('--selfsky-mode', default='global',
                     choices=['global', 'per-column'])
     ap.add_argument('--selfsky-blocks', type=int, default=hcss.DEFAULT_COL_BLOCKS)
+    ap.add_argument('--seed-velocity', action='store_true',
+                    help='shift each spaxel\'s line centroids by a velocity measured '
+                         'against the mean-spectrum fit (HyperCube_VelocitySeed). '
+                         'Writes *_vseed_Fit.csv and *_vseed_seeds.fits.')
+    ap.add_argument('--seed-vmax', type=float, default=500.0,
+                    help='km/s search half-range; keep below the closest doublet '
+                         'spacing in the model (641 km/s for [S II])')
+    ap.add_argument('--seed-dv', type=float, default=10.0, help='km/s grid step')
+    ap.add_argument('--seed-snr', type=float, default=5.0,
+                    help='matched-filter S/N a velocity needs to be trusted')
+    ap.add_argument('--seed-fmin', type=float, default=0.25,
+                    help='share of line signal the template must explain to be '
+                         'trusted (rejects aliases)')
     ap.add_argument('--muse-lsf', default=hlsf.MUSE_LSF_DEFAULT,
                     choices=sorted(hlsf.MUSE_LSF_MODELS))
     args = ap.parse_args(argv)

@@ -11,7 +11,15 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 
 ---
 
-## What's New in v0.5.0
+## What's New in v0.5.1
+
+- **Velocity-seeded cube fits.** When rotation moves lines hundreds of km/s across a field, starting every spaxel from one set of guesses lets fits far from where the model was built wander off. Tick **V-seed** (Fit Parameters, beside *Sequential*) or pass `--seed-velocity` to the batch: each spaxel's velocity is measured by matched-filtering *all* the model's lines at once against a fit to the mean spectrum, median-filtered over its neighbours, and used to shift that spaxel's free line centroids (and their bounds) before the fit. Amplitudes, widths and component count still start from the model. On two MAUNA MUSE cubes, Hα–[N II] velocity disagreements > 200 km/s fell from 15–19% of spaxels to ~2%, and velocity-map outliers from 13–17% to < 1%. Off by default. See [Velocity-seeded cube fits](#velocity-seeded-cube-fits).
+- **Self-sky: write the correction into the cube file.** **💾 Write to FITS…** puts an applied self-sky subtraction (and its added variance) into the cube itself, after copying the original arrays to `<cube>_preSelfSky.fits`; **↩ Restore original FITS…** puts them back byte-exactly. The header is stamped `HCSKYSUB=T`, so a corrected file can never be subtracted twice — not by *Apply*, and not by a session saved before the write.
+- **Export alignment without touching the cube.** **📤 Export alignment** in the *Background Image* dialog writes the Align X/Y shift as a sky offset to `<cube>.hst_alignment.json`. The cube and its WCS are unchanged, so nothing needs refitting; plotting tools apply the offset when maps are drawn.
+- **Mask Spaxels opens fast.** The fitted-map list is vectorised (8.8 s → 0.3 s on a 19k-spaxel fit), and per-line S/N maps are computed only when a line is ticked, then cached in memory and in `<cube>.snr_cache.npz` beside the cube. The cache key includes everything the map depends on — including the file's size and modification time — so it can never go stale.
+- **pPXF emission-line mask width** is now a parameter (`mask_dv`, km/s half-width, default 500 as before) of `HyperCube_pPXF.fit_stellar`.
+
+### Also in v0.5.0
 
 - **Rest-frame fitting templates.** A template (`*.hct.csv`) states a model the way physics does — rest wavelengths, velocity offsets from systemic, *intrinsic* velocity dispersions, bounds, K-groups, constraints — so **one file applies to every galaxy observed with a given instrument**. Nothing galaxy-specific lives in it: redshift and cube path come from a **manifest**, and the instrument's resolution from the cube itself. **Save Template / Load Template** are on the *Output:* toolbar row. See [Initiating Models with Configuration Files](#initiating-models-with-configuration-files).
 - **Headless batch mode.** `python -m hypercube_batch` expands a template across a manifest and fits every target unattended, writing products the GUI reopens plus a `run_log.csv` recording the template, its version and the git SHA. `--dry-run` reports which lines are observable per galaxy before you spend time fitting. See [Pipeline Usage Mode](#pipeline-usage-mode).
@@ -23,7 +31,7 @@ HyperCube is a python-based spectral fitting tool designed to make integral fiel
 - **Per-component constraints, multi-extension FITS ingest, and UI scaling.** Smart Constraints gains a per-component-tier bound table and blue/red side constraints for broad wings; an extension picker handles multi-extension FITS; and the interface scales to the display and platform font.
 - **Names are yours.** NED is asked for the **measurement**, never for a relabelling — resolving `F01364-1042` can no longer rename your target `2MASX J01385289-1027113` and break every join you have against your own catalogues.
 
-Templates, sessions and fit products from v0.4 still load.
+Templates, sessions and fit products from v0.4 and v0.5.0 still load. Unseeded fits are unchanged: with V-seed off, the fit tasks are exactly what they were.
 
 The full history is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -50,6 +58,7 @@ The full history is in [CHANGELOG.md](CHANGELOG.md).
    - [Resolving power](#resolving-power)
    - [Calibrated fit-quality metrics & the Quality Map](#calibrated-fit-quality-metrics--the-quality-map)
    - [Rectify Bad Fits](#rectify-bad-fits)
+   - [Velocity-seeded cube fits](#velocity-seeded-cube-fits)
 5. [Stellar Kinematics with pPXF](#stellar-kinematics-with-ppxf)
 6. [Pipeline Usage Mode](#pipeline-usage-mode)
    - [Initiating Models with Configuration Files](#initiating-models-with-configuration-files)
@@ -342,7 +351,7 @@ Because the numbers this produces are smaller than the un-subtracted ones it rep
 
 *Map criterion* keeps spaxels where a chosen map passes a test — any fitted parameter or quality map, or a **channel map built from the live C window** minus any locked X/V sidebands. The channel map needs no fit, so the dialog opens on a cube you have not fitted yet, and it is rebuilt on every access: the dialog is modeless, you are expected to move the C window while it is open, and a cached map would mask on a stale selection.
 
-*S/N* offers every line in the model with **its own threshold per line**, one operator, and an **any / all** combiner. One universal cut is wrong whenever lines differ in brightness — [O III] 4959 is a third of 5007 by atomic physics, so a cut that keeps 4959 is far too lax for 5007. On a graded synthetic pair, `all` at 15/5 keeps 146 spaxels against 31 for a universal 15/15. Use `any` when one detected line is enough; use `all` when a line *ratio* has to be measurable in the same spaxel.
+*S/N* offers every line in the model with **its own threshold per line**, one operator, and an **any / all** combiner. One universal cut is wrong whenever lines differ in brightness — [O III] 4959 is a third of 5007 by atomic physics, so a cut that keeps 4959 is far too lax for 5007. On a graded synthetic pair, `all` at 15/5 keeps 146 spaxels against 31 for a universal 15/15. Use `any` when one detected line is enough; use `all` when a line *ratio* has to be measurable in the same spaxel. Lines start unticked, and a line's S/N map is computed only when you tick it. It is then kept, in memory and in `<cube>.snr_cache.npz` beside the cube, so reopening the dialog or a later session does not recompute it. The cache key covers the cube file (size and modification time), flux scale, any self-sky correction, the line centre, the windows and the S/N formula version, so it cannot go stale.
 
 > ⚠️ **This changed in v0.5.0.** Masking used to be display-only. There is now a single definition of which spaxels are fitted — the S/N gate **AND** everything hidden by Mask Spaxels — and the main cube fit, the Rectify re-fit, the stellar fit and Rectify's count preview all use it. **Masked spaxels are no longer fitted.** *Unmask* clears the S/N gate too, so the fit is never left silently gated with nothing on screen to say so.
 
@@ -359,6 +368,8 @@ The residual is **additive**: its excess over the local sidebands is flat at ≈
 - Subtraction happens only where a spaxel has data — off-detector voxels are exact zeros, not NaN — and an unusably small pool refuses to produce a sky rather than producing a noisy one.
 
 Per-column mode fits the residual's ≈30% across-slice gradient, which matches the DRP modelling sky per slice. On the driver cube the faint-region artifact goes from 0.00772 to **−0.00001** and the gradient flattens ≈9×, while the real [N II] 6548 survives. Provenance rides in the fit CSV's header and the window title, so a fit from a corrected cube is distinguishable from one that is not; **Revert** restores the cube bit-identically.
+
+**Writing the correction into the file.** An in-memory correction lasts for the session (and is re-applied when the session is restored). To make it permanent, **💾 Write to FITS…** rewrites only the changed voxels — converted back to the file's own flux units — and adds the sky variance to the error extension in that extension's own convention (variance, inverse variance or σ, in the same file or a sidecar). The original arrays are first copied *from disk* to `<cube>_preSelfSky.fits`, and everything else in the file stays bit-identical. The science header gets `HCSKYSUB=T` plus the recipe; on load, HyperCube reads it, refuses another *Apply*, skips re-applying a session's self-sky, labels fits from the file `in FITS file`, and shows `[self-sky in FITS]` in the title. **↩ Restore original FITS…** puts the original arrays back, verifies them byte-for-byte, and only then deletes the backup.
 
 Headless, `--selfsky 60` does the same with the faintest-*N*% recipe. The batch rebuilds the mask from its arguments rather than loading a saved array, so a run stays reproducible and a stale mask cannot be applied to the wrong cube.
 
@@ -409,6 +420,34 @@ It works in four steps:
 Every repaired row records where it came from: `rectify_pass`, `rectify_seed` (e.g. `neighbour(12,34)@r2`, `restart:swapped`, `incumbent`) and `rectify_score`, so a rectified fit is auditable rather than indistinguishable from an ordinary one.
 
 Constraints, kinematic groups, and (if enabled) [sequential core→outflow staging](#sequential-coreoutflow-fitting) all carry through to the rectify refits automatically. The combination of a calibrated metric, a spatial prior, and targeted restarts resolves most degenerate/initialization failures without manual intervention; the handful that survive can be cleaned up with [per-spaxel correction](#per-spaxel-fit-correction).
+
+### Velocity-seeded cube fits
+
+A cube fit starts every spaxel from the same initial guesses. When rotation moves the lines by hundreds of km/s across the field, spaxels far from where the model was built start far from their lines, and the optimiser can settle on a neighbouring line or a noise feature. Velocity seeding gives each spaxel its own starting velocity. It is off by default: tick **V-seed** in the Fit Parameters toolbar (row 2, beside *Sequential*) for GUI cube fits, or pass `--seed-velocity` to `hypercube_batch`. It applies to Fit Cube in both the parallel and serial paths. It does not apply to single-spaxel fits or Rectify.
+
+1. The model is fitted to the **mean spectrum** of the gated spaxels.
+2. Every spaxel is **matched-filtered against all of those lines at once** over ±`vmax` (500 km/s by default). Matching every line together is what keeps it off the Hα/[N II] aliases.
+3. A velocity is **trusted** only if its matched-filter S/N reaches `--seed-snr` (5) *and* the template explains at least `--seed-fmin` (0.25) of the line signal. S/N alone cannot reject an alias: a shift beyond the search range peaks *inside* it at high S/N, but explains little of the signal.
+4. Trusted velocities are **median-filtered** 3×3, with wider boxes for gaps. The result shifts each spaxel's free line centroids, together with their finite bounds.
+
+Only centroids move. Amplitudes, widths and component count still start from the model, and tied or frozen centroids are left alone. Shifts are measured against the **model's** centroids, not the mean-spectrum fit's: the mean spectrum of a rotating field is double-horned, so its fitted centroids sit tens of km/s off where lines blend.
+
+Measured on two MAUNA MUSE cubes with the same code and weights in both runs:
+
+| | F14348-1447 unseeded → seeded | F09111-1007 unseeded → seeded |
+|---|---|---|
+| Hα vs [N II] 6583 \|Δv\| > 200 km/s | 15.4% → 1.6% | 18.5% → 2.1% |
+| Hα velocity-map outliers | 13.2% → 0.4% | 17.1% → 0.8% |
+| `rchisq_w` > 3 | 6.5% → 1.9% | 21.6% → 11.6% |
+
+The gains concentrate at large shifts. Seeding adds about 20 s per cube. Batch output for a seeded run uses its own stem, `*_vseed_Fit.csv`, so it can never overwrite the unseeded fit it is compared against. Alongside it, `*_vseed_seeds.fits` holds the seed, raw velocity, S/N, explained fraction, trusted flag and filter window, so every seed can be audited. `vel_init_kms` in the CSV records each line's seeded start. In the GUI the seed summary is printed to the console.
+
+```
+python -m hypercube_batch --template T.hct.csv --manifest M.manifest.csv --out runs/ \
+       --seed-velocity [--seed-vmax 500] [--seed-dv 10] [--seed-snr 5] [--seed-fmin 0.25]
+```
+
+Keep `--seed-vmax` below the closest doublet spacing in the model (641 km/s for [S II]).
 
 
 # Stellar Kinematics with pPXF
@@ -484,6 +523,11 @@ five-section layout **Load Fit (CSV)** reads, plus a coverage report; a
 timings. A failing target is logged and the run continues, exiting non-zero at
 the end.
 
+`--selfsky PCT` applies [self-sky subtraction](#self-sky-subtraction) right after
+each cube is loaded. `--seed-velocity` gives each spaxel its own starting velocity
+([velocity-seeded cube fits](#velocity-seeded-cube-fits)) and writes
+`*_vseed_Fit.csv` plus `*_vseed_seeds.fits`.
+
 This does **not** make per-spaxel fitting faster — it is the same kernel and the
 same process pool the GUI uses (`build_params` and `run_pool` in
 `HyperCube_fit.py`, shared by both). What it buys is unattended queued runs,
@@ -497,3 +541,5 @@ If you get the "UnboundLocalError: cannot access local variable 'piecewise_model
 If you used HyperCube in your research, please consider acknowledging the use of the tool by including this text in your publications:
 
 _This research has made use of HyperCube, the interactive analysis tool for integral field spectroscopic data, written by Justin A Kader._
+
+Citation metadata for the software release is in [`CITATION.cff`](CITATION.cff). GitHub's **Cite this repository** button (in the repository sidebar) turns it into APA or BibTeX.

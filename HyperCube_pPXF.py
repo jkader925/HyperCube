@@ -236,7 +236,7 @@ def _goodpixels(ln_lam_gal, ln_lam_temp, mask_centroids, z, mask_dv=500.0):
 
 def fit_stellar(flux, wavelengths, z, R, library, *, fit_range,
                 mask_centroids=(), moments=2, degree=-1, mdegree=10,
-                sigma_guess=150.0, velscale=None):
+                sigma_guess=150.0, velscale=None, mask_dv=500.0):
     """Run pPXF on one spaxel.
 
     flux         : 1D galaxy spectrum (cube units), same length as wavelengths
@@ -245,6 +245,7 @@ def fit_stellar(flux, wavelengths, z, R, library, *, fit_range,
     library      : a prepared TemplateLibrary (call .prepare(velscale,...) first)
     fit_range    : (λ1, λ2) in OBSERVED wavelength
     mask_centroids : observed-frame emission-line centroids to mask
+    mask_dv      : half-width (km/s) of the window masked around each centroid
     Returns a dict: V, sigma, h3, h4, scale, chi2, success, cache, bestfit.
     """
     flux = np.nan_to_num(np.asarray(flux, float))
@@ -264,7 +265,7 @@ def fit_stellar(flux, wavelengths, z, R, library, *, fit_range,
 
     templates = library.templates
     ln_lam_temp = library.ln_lam_temp
-    good = _goodpixels(ln_lam_gal, ln_lam_temp, mask_centroids, z)
+    good = _goodpixels(ln_lam_gal, ln_lam_temp, mask_centroids, z, mask_dv=mask_dv)
 
     pp = ppxf(templates, galaxy, noise, velscale, [0.0, float(sigma_guess)],
               goodpixels=good, moments=moments, degree=degree, mdegree=mdegree,
