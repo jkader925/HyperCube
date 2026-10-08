@@ -8,6 +8,8 @@
 
 HyperCube is a python-based spectral fitting tool designed to make integral field spectroscopic (IFS), or hyperspectral data analysis more interactive and intuitive, while preserving automation and repeatability. The tool combines a user-friendly [PyQT5](https://github.com/PyQt5) GUI with the robust and flexible fitting capabilities of [lmfit](https://github.com/lmfit/lmfit-py), and is particularly well-suited for interactive and batch process spectral modeling of 3D spectral data.
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23247289.svg)](https://doi.org/10.5281/zenodo.23247289) — to cite HyperCube, see [Acknowledging HyperCube](#acknowledging-hypercube).
+
 
 ---
 
@@ -541,5 +543,25 @@ If you get the "UnboundLocalError: cannot access local variable 'piecewise_model
 If you used HyperCube in your research, please consider acknowledging the use of the tool by including this text in your publications:
 
 _This research has made use of HyperCube, the interactive analysis tool for integral field spectroscopic data, written by Justin A Kader._
+
+Please also cite the archived release you used. HyperCube is archived on Zenodo:
+
+- **v0.5.1:** [doi:10.5281/zenodo.23247289](https://doi.org/10.5281/zenodo.23247289)
+- **All versions** (resolves to the latest release): [doi:10.5281/zenodo.23247288](https://doi.org/10.5281/zenodo.23247288)
+
+Cite the version-specific DOI of the release that produced your results:
+
+```bibtex
+@software{Kader26_HyperCube,
+   author = {{Kader}, Justin},
+    title = "{HyperCube}",
+     year = 2026,
+    month = oct,
+  version = {v0.5.1},
+publisher = {Zenodo},
+      doi = {10.5281/zenodo.23247289},
+      url = {https://doi.org/10.5281/zenodo.23247289}
+}
+```
 
 Citation metadata for the software release is in [`CITATION.cff`](CITATION.cff). GitHub's **Cite this repository** button (in the repository sidebar) turns it into APA or BibTeX.

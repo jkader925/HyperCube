@@ -6,7 +6,15 @@ authors:
   - family-names: "Kader"
     given-names: "Justin A."
 version: "0.5.1"
+doi: 10.5281/zenodo.23247289
 date-released: 2026-10-08
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23247289
+    description: "Zenodo archive of this release (v0.5.1)"
+  - type: doi
+    value: 10.5281/zenodo.23247288
+    description: "Zenodo concept DOI (resolves to the latest release)"
 license: MIT
 repository-code: "https://github.com/jkader925/HyperCube"
 url: "https://github.com/jkader925/HyperCube"
